@@ -39,12 +39,20 @@ class Base64PDFRequest(BaseModel):
     base64_pdf: str
     filename: str = "page.pdf"
     page_number: int = 1
+    
+    class Config:
+        # Add this for compatibility with Pydantic v1
+        extra = "forbid"
 
 class PDFURLRequest(BaseModel):
     """Request model for PDF URL processing"""
     pdf_url: str
     filename: str = "document.pdf"
     page_number: int = 1
+    
+    class Config:
+        # Add this for compatibility with Pydantic v1
+        extra = "forbid"
 
 @app.post("/analyze-pdf/")
 async def analyze_pdf(file: UploadFile = File(...)):
