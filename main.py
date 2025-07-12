@@ -1,9 +1,3 @@
-"""
-Master API - Coordinates Vector Extraction, Scale Detection, and Wall Detection APIs
-Optimized for production-readiness and school project testing
-Downloads PDF, extracts vector data, calculates scale, and detects walls
-"""
-
 import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, HttpUrl, Field
@@ -265,6 +259,7 @@ if __name__ == "__main__":
         "bind": "0.0.0.0:" + str(port),
         "workers": 4,
         "worker_class": "uvicorn.workers.UvicornWorker",
-        "timeout": 300  # Set timeout to 300 seconds
+        "timeout": 300,  # Enforce 300-second timeout
+        "graceful_timeout": 300  # Allow 300 seconds for graceful shutdown
     }
     StandaloneApplication(app, options).run()
