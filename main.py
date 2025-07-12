@@ -1,7 +1,7 @@
 """
-Master API - Coordinates Vector Extraction and Scale Detection APIs
+Master API - Coordinates Vector Extraction, Scale Detection, and Wall Detection APIs
 Optimized for production-readiness and school project testing
-Downloads PDF, extracts vector data, and calculates scale
+Downloads PDF, extracts vector data, calculates scale, and detects walls
 """
 
 import requests
@@ -24,8 +24,8 @@ logger = logging.getLogger("master_api")
 
 app = FastAPI(
     title="Master API",
-    description="Coordinates Vector Extraction and Scale Detection for construction drawings",
-    version="1.1.1",
+    description="Coordinates Vector Extraction, Scale Detection, and Wall Detection for construction drawings",
+    version="1.2.0",
     docs_url="/docs/",
     openapi_url="/openapi.json"
 )
@@ -51,6 +51,7 @@ class DrawingRequest(BaseModel):
 class MasterResponse(BaseModel):
     vector_data: Dict[str, Any] = Field(..., description="Extracted vector data")
     scale_data: List[Dict[str, Any]] = Field(..., description="Detected scale data")
+    wall_data: List[Dict[str, Any]] = Field(..., description="Detected wall data")
     message: str = Field(..., description="Processing status")
     processing_time_ms: int = Field(..., description="Total processing time in milliseconds")
 
@@ -59,6 +60,7 @@ class MasterConfig:
     def __init__(self):
         self.vector_api_url = os.getenv("VECTOR_API_URL", "https://vector-api-0wlf.onrender.com/extract-vectors/")
         self.scale_api_url = os.getenv("SCALE_API_URL", "https://scale-api-5f65.onrender.com/detect-scale-from-json/")
+        self.wall_api_url = os.getenv("WALL_API_URL", "https://wall-api.onrender.com/detect-walls/")
         self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", "30.0"))
         self.max_file_size = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024
 
@@ -101,8 +103,8 @@ async def root():
     """Root endpoint with API overview"""
     return {
         "service": "Master API",
-        "version": "1.1.1",
-        "description": "Coordinates Vector Extraction and Scale Detection for construction drawings",
+        "version": "1.2.0",
+        "description": "Coordinates Vector Extraction, Scale Detection, and Wall Detection for construction drawings",
         "endpoints": {
             "process_drawing": "/process-drawing/",
             "health": "/health/",
@@ -118,7 +120,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "master-api",
-        "version": "1.1.1",
+        "version": "1.2.0",
         "memory_usage_mb": round(memory, 2),
         "timestamp": datetime.now().isoformat(),
         "config": vars(config)
@@ -145,7 +147,7 @@ async def cleanup_async(file_path: str, delay: float = 1.0):
 
 @app.post("/process-drawing/", response_model=MasterResponse)
 async def process_drawing(request_items: List[DrawingRequest], background_tasks: BackgroundTasks):
-    """Process a drawing by downloading PDF, extracting vector data, and calculating scale"""
+    """Process a drawing by downloading PDF, extracting vector data, calculating scale, and detecting walls"""
     start_time = time.time()
     request_id = str(uuid.uuid4())
 
@@ -154,7 +156,7 @@ async def process_drawing(request_items: List[DrawingRequest], background_tasks:
 
     item = request_items[0]
     url = str(item.url)
-    page_number = item.page_number  # Logged but not used for Vector call, as PDF is single-page
+    page_number = item.page_number
 
     logger.info(f"Processing drawing: {url}, page {page_number} [Request ID: {request_id}]")
 
@@ -183,7 +185,6 @@ async def process_drawing(request_items: List[DrawingRequest], background_tasks:
         vector_data = vector_response.json()
         if not vector_data or not vector_data.get("pages"):
             raise MasterProcessingError("Invalid vector data received")
-        # Since input PDF is single-page, take pages[0]
         vector_page = vector_data["pages"][0]
         logger.info(f"Vector data extracted: {vector_data['summary']['total_lines']} lines, "
                    f"{vector_data['summary']['total_texts']} texts")
@@ -204,16 +205,38 @@ async def process_drawing(request_items: List[DrawingRequest], background_tasks:
         scale_data = scale_response.json()
         if not scale_data or scale_data[0].get("confidence", 0) == 0:
             logger.warning("No reliable scale found")
+            scale_m_per_pixel = 1.0  # Fallback to avoid division by zero
         else:
             logger.info(f"Scale detected: {scale_data[0]['scale_ratio']} (confidence: {scale_data[0]['confidence']})")
+            scale_m_per_pixel = scale_data[0]["real_meters_per_drawn_cm"] / 28.346  # Convert cm to points
     except requests.RequestException as e:
         logger.error(f"Error calling Scale API: {e}", exc_info=True)
         raise MasterAPIError(f"Failed to call Scale API: {str(e)}")
+
+    # Step 4: Call Wall Detection API with vector data and scale
+    try:
+        wall_json = {
+            "pages": [vector_page],
+            "scale_m_per_pixel": scale_m_per_pixel
+        }
+        wall_response = requests.post(
+            config.wall_api_url,
+            json=wall_json,
+            headers={"Content-Type": "application/json"},
+            timeout=config.request_timeout
+        )
+        wall_response.raise_for_status()
+        wall_data = wall_response.json()
+        logger.info(f"Wall data detected: {wall_data['pages'][0]['page_statistics']['total_walls']} walls")
+    except requests.RequestException as e:
+        logger.error(f"Error calling Wall API: {e}", exc_info=True)
+        raise MasterAPIError(f"Failed to call Wall API: {str(e)}")
 
     processing_time_ms = int((time.time() - start_time) * 1000)
     return MasterResponse(
         vector_data=vector_page,
         scale_data=scale_data,
+        wall_data=wall_data["pages"],
         message="Drawing processed successfully",
         processing_time_ms=processing_time_ms
     )
