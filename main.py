@@ -61,7 +61,7 @@ class MasterConfig:
         self.vector_api_url = os.getenv("VECTOR_API_URL", "https://vector-api-0wlf.onrender.com/extract-vectors/")
         self.scale_api_url = os.getenv("SCALE_API_URL", "https://scale-api-5f65.onrender.com/detect-scale-from-json/")
         self.wall_api_url = os.getenv("WALL_API_URL", "https://wall-api.onrender.com/detect-walls/")
-        self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", "60.0"))
+        self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", "300.0"))
         self.max_file_size = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024
 
 config = MasterConfig()
@@ -243,5 +243,28 @@ async def process_drawing(request_items: List[DrawingRequest], background_tasks:
 
 if __name__ == "__main__":
     import uvicorn
+    from gunicorn.app.base import BaseApplication
+    import os
+
+    class StandaloneApplication(BaseApplication):
+        def __init__(self, app, options=None):
+            self.application = app
+            self.options = options or {}
+            super().__init__()
+
+        def load_config(self):
+            for key, value in self.options.items():
+                if key in self.cfg.settings and value is not None:
+                    self.cfg.set(key.lower(), value)
+
+        def load(self):
+            return self.application
+
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    options = {
+        "bind": "0.0.0.0:" + str(port),
+        "workers": 4,
+        "worker_class": "uvicorn.workers.UvicornWorker",
+        "timeout": 300  # Set timeout to 300 seconds
+    }
+    StandaloneApplication(app, options).run()
