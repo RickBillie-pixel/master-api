@@ -45,9 +45,12 @@ class MasterAPIError(HTTPException):
         super().__init__(status_code=500, detail=detail)
 
 # Models
-class DrawingRequest(BaseModel):
-    url: HttpUrl = Field(..., description="URL of the PDF drawing")
-    page_number: int = Field(..., ge=1, description="Page number to process")
+class InputBody(BaseModel):
+    fileUrl: HttpUrl = Field(..., description="URL of the PDF drawing")
+    fileName: Optional[str] = Field(None, description="Name of the file")
+
+class InputItem(BaseModel):
+    body: InputBody
 
 class MasterResponse(BaseModel):
     vector_data: Dict[str, Any] = Field(..., description="Extracted vector data")
@@ -59,7 +62,7 @@ class MasterResponse(BaseModel):
 class MasterConfig:
     def __init__(self):
         self.vector_api_url = os.getenv("VECTOR_API_URL", "https://vector-api-0wlf.onrender.com/extract-vectors-from-urls/")
-        self.scale_api_url = os.getenv("SCALE_API_URL", "https://your-scale-api.onrender.com/detect-scale-from-json/")
+        self.scale_api_url = os.getenv("SCALE_API_URL", "https://scale-api-5f65.onrender.com/detect-scale-from-json/")
         self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", "30.0"))
         self.max_file_size = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024
 
@@ -145,15 +148,24 @@ async def cleanup_async(file_path: str, delay: float = 1.0):
         logger.error(f"Error during cleanup: {e}")
 
 @app.post("/process-drawing/", response_model=MasterResponse)
-async def process_drawing(request: DrawingRequest, background_tasks: BackgroundTasks):
+async def process_drawing(request_items: List[InputItem], background_tasks: BackgroundTasks):
     """Process a drawing by downloading PDF, extracting vector data, and calculating scale"""
     start_time = time.time()
     request_id = str(uuid.uuid4())
-    logger.info(f"Processing drawing: {request.url}, page {request.page_number} [Request ID: {request_id}]")
+
+    if len(request_items) != 1:
+        raise MasterProcessingError("Expected exactly one input item")
+
+    item = request_items[0]
+    url = str(item.body.fileUrl)
+    # file_name = item.body.fileName  # Not used currently
+    page_number = 1  # Default since not provided in input
+
+    logger.info(f"Processing drawing: {url}, page {page_number} [Request ID: {request_id}]")
 
     # Step 1: Download PDF
     try:
-        pdf_response = requests.get(str(request.url), timeout=config.request_timeout)
+        pdf_response = requests.get(url, timeout=config.request_timeout)
         pdf_response.raise_for_status()
         pdf_data = pdf_response.content
         if len(pdf_data) > config.max_file_size:
@@ -169,7 +181,7 @@ async def process_drawing(request: DrawingRequest, background_tasks: BackgroundT
     try:
         vector_response = requests.post(
             config.vector_api_url,
-            json=[{"url": str(request.url), "page_number": request.page_number}],
+            json=[{"url": url, "page_number": page_number}],
             headers={"Content-Type": "application/json"},
             timeout=config.request_timeout
         )
