@@ -1,6 +1,6 @@
 """
 Master API - Coordinates Vector Extraction and Scale Detection APIs
-Optimized by Grok 4 Heavy for production-readiness and school project testing
+Optimized for production-readiness and school project testing
 Downloads PDF, extracts vector data, and calculates scale
 """
 
@@ -13,7 +13,6 @@ import uuid
 from datetime import datetime
 import asyncio
 import os
-import tempfile
 import time
 
 # Configure logging
@@ -155,7 +154,7 @@ async def process_drawing(request_items: List[DrawingRequest], background_tasks:
 
     item = request_items[0]
     url = str(item.url)
-    page_number = item.page_number
+    page_number = item.page_number  # Logged but not used for Vector call, as PDF is single-page
 
     logger.info(f"Processing drawing: {url}, page {page_number} [Request ID: {request_id}]")
 
@@ -173,18 +172,19 @@ async def process_drawing(request_items: List[DrawingRequest], background_tasks:
         logger.error(f"Error downloading PDF: {e}", exc_info=True)
         raise MasterProcessingError(f"Failed to download PDF: {str(e)}")
 
-    # Step 2: Call Vector Extraction API with PDF file and page number
+    # Step 2: Call Vector Extraction API with PDF file
     try:
         vector_response = requests.post(
             config.vector_api_url,
             files={"file": ("drawing.pdf", pdf_data, "application/pdf")},
-            params={"page": page_number},
             timeout=config.request_timeout
         )
         vector_response.raise_for_status()
         vector_data = vector_response.json()
         if not vector_data or not vector_data.get("pages"):
             raise MasterProcessingError("Invalid vector data received")
+        # Since input PDF is single-page, take pages[0]
+        vector_page = vector_data["pages"][0]
         logger.info(f"Vector data extracted: {vector_data['summary']['total_lines']} lines, "
                    f"{vector_data['summary']['total_texts']} texts")
     except requests.RequestException as e:
@@ -193,9 +193,10 @@ async def process_drawing(request_items: List[DrawingRequest], background_tasks:
 
     # Step 3: Call Scale Detection API with vector data
     try:
+        scale_json = {"pages": [vector_page], "summary": vector_data["summary"]}
         scale_response = requests.post(
             config.scale_api_url,
-            json=vector_data,
+            json=scale_json,
             headers={"Content-Type": "application/json"},
             timeout=config.request_timeout
         )
@@ -211,7 +212,7 @@ async def process_drawing(request_items: List[DrawingRequest], background_tasks:
 
     processing_time_ms = int((time.time() - start_time) * 1000)
     return MasterResponse(
-        vector_data=vector_data["pages"][0],
+        vector_data=vector_page,
         scale_data=scale_data,
         message="Drawing processed successfully",
         processing_time_ms=processing_time_ms
