@@ -6,7 +6,7 @@ Downloads PDF, extracts vector data, and calculates scale
 
 import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, Field
 from typing import List, Dict, Any, Optional
 import logging
 import uuid
@@ -25,7 +25,7 @@ logger = logging.getLogger("master_api")
 app = FastAPI(
     title="Master API",
     description="Coordinates Vector Extraction and Scale Detection for construction drawings",
-    version="1.1.0",
+    version="1.1.1",
     docs_url="/docs/",
     openapi_url="/openapi.json"
 )
@@ -101,7 +101,7 @@ async def root():
     """Root endpoint with API overview"""
     return {
         "service": "Master API",
-        "version": "1.1.0",
+        "version": "1.1.1",
         "description": "Coordinates Vector Extraction and Scale Detection for construction drawings",
         "endpoints": {
             "process_drawing": "/process-drawing/",
@@ -118,7 +118,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "master-api",
-        "version": "1.1.0",
+        "version": "1.1.1",
         "memory_usage_mb": round(memory, 2),
         "timestamp": datetime.now().isoformat(),
         "config": vars(config)
