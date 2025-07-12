@@ -1,227 +1,487 @@
 """
-Master API - Coordinates Vector Extraction and Scale Detection APIs
-Optimized by Grok 4 Heavy for production-readiness and school project testing
-Downloads PDF, extracts vector data, and calculates scale
+Vector API - Pure Vector Extraction
+Extracts raw vector data, text, and geometric elements from PDF files
+No business logic - only data extraction for other services to process
 """
-
-import requests
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel, HttpUrl, Field
-from typing import List, Dict, Any, Optional
+import fitz  # PyMuPDF
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Query
 import logging
-import uuid
-from datetime import datetime
-import asyncio
-import os
-import tempfile
+import re
+from typing import List, Dict, Any, Optional
+import math
+from pydantic import BaseModel
 import time
+from datetime import datetime
+import os
+import io
+import requests
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("master_api")
+logger = logging.getLogger("vector_api")
+
+# Constants for Vector Extraction
+MAX_PAGE_SIZE = 10000  # Max dimension for very large pages
+MIN_LINE_LENGTH = 0.1  # Minimum line length to consider (in points)
+TEXT_BLOCKS_METHOD = "dict"  # Use 'dict' for better text block extraction
+
+# Utility functions
+def point_to_dict(p) -> dict:
+    """Convert PyMuPDF point to dictionary with 2 decimal places precision"""
+    return {"x": round(p.x, 2), "y": round(p.y, 2)}
+
+def rect_to_dict(r) -> dict:
+    """Convert PyMuPDF rectangle to dictionary with 2 decimal places precision"""
+    if isinstance(r, tuple):
+        return {
+            "x0": round(r[0], 2), "y0": round(r[1], 2),
+            "x1": round(r[2], 2), "y1": round(r[3], 2),
+            "width": round(r[2] - r[0], 2), "height": round(r[3] - r[1], 2)
+        }
+    return {
+        "x0": round(r.x0, 2), "y0": round(r.y0, 2),
+        "x1": round(r.x1, 2), "y1": round(r.y1, 2),
+        "width": round(r.width, 2), "height": round(r.height, 2)
+    }
+
+def distance(p1: dict, p2: dict) -> float:
+    """Calculate distance between two points"""
+    return math.sqrt((p2['x'] - p1['x'])**2 + (p2['y'] - p1['y'])**2)
+
+def is_vector_page(page) -> bool:
+    """
+    Determine if a page contains vector content
+    Used for vectorcheck as per the knowledge base
+    """
+    # Check for vector drawings
+    drawings = page.get_drawings()
+    if drawings:
+        return True
+    
+    # Check for vector text
+    text_dict = page.get_text("dict")
+    if text_dict and "blocks" in text_dict and text_dict["blocks"]:
+        return True
+    
+    return False
+
+class MemoryMonitor:
+    """Monitor memory usage"""
+    @staticmethod
+    def get_memory_usage():
+        """Get current memory usage in MB"""
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            memory_info = process.memory_info()
+            return memory_info.rss / 1024 / 1024  # Convert to MB
+        except ImportError:
+            return 0  # psutil not available
 
 app = FastAPI(
-    title="Master API",
-    description="Coordinates Vector Extraction and Scale Detection for construction drawings",
-    version="1.1.1",
-    docs_url="/docs/",
-    openapi_url="/openapi.json"
+    title="Vector Extraction API",
+    description="Extracts raw vector data, text, and geometric elements from PDF files",
+    version="4.0.0",
 )
 
-app_start_time = datetime.now()
+class VectorCheckResponse(BaseModel):
+    """Response model for vector check endpoint"""
+    page_number: int
+    is_vector: bool
+    page_url: Optional[str] = None
 
-# Custom exceptions
-class MasterProcessingError(HTTPException):
-    """Exception for Master API processing errors"""
-    def __init__(self, detail: str = "Processing error"):
-        super().__init__(status_code=400, detail=detail)
+class UrlRequest(BaseModel):
+    url: str
+    page_number: int = 1
 
-class MasterAPIError(HTTPException):
-    """Exception for downstream API failures"""
-    def __init__(self, detail: str = "Downstream API error"):
-        super().__init__(status_code=500, detail=detail)
+@app.post("/extract-vectors-from-urls/")
+async def extract_vectors_from_urls(requests: List[UrlRequest]):
+    """
+    Extract raw vector data and text from PDFs at given URLs, for specific pages only.
+    
+    Returns:
+        List of JSON objects, each with raw page data for the requested URL and page.
+    """
+    outputs = []
+    for req in requests:
+        try:
+            logger.info(f"Downloading PDF from URL: {req.url}")
+            pdf_response = requests.get(req.url, timeout=30)
+            pdf_response.raise_for_status()
+            pdf_bytes = pdf_response.content
+            if not pdf_bytes:
+                raise ValueError("Empty PDF from URL")
+            
+            pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+            if req.page_number < 1 or req.page_number > len(pdf_document):
+                raise ValueError(f"Invalid page number {req.page_number} (PDF has {len(pdf_document)} pages)")
+            
+            page = pdf_document[req.page_number - 1]
+            page_start_time = time.time()
+            logger.info(f"Processing page {req.page_number} from URL {req.url}")
+            
+            if page.rect.width > MAX_PAGE_SIZE or page.rect.height > MAX_PAGE_SIZE:
+                logger.warning(f"Very large page detected: {page.rect.width}x{page.rect.height}")
+            
+            has_vector = is_vector_page(page)
+            logger.info(f"Page {req.page_number} vector content: {has_vector}")
+            
+            lines = []
+            rectangles = []
+            curves = []
+            
+            for path in page.get_drawings():
+                for item in path["items"]:
+                    item_type = item[0]
+                    points = item[1:]
+                    
+                    if item_type == "l":  # Line
+                        p1 = point_to_dict(points[0])
+                        p2 = point_to_dict(points[1])
+                        line_length = distance(p1, p2)
+                        
+                        if line_length < MIN_LINE_LENGTH:
+                            continue
+                            
+                        line_data = {
+                            "type": "line", 
+                            "p1": p1, 
+                            "p2": p2,
+                            "length": line_length,
+                            "color": path.get("color", [0, 0, 0]),
+                            "width": round(path.get("width", 1), 2)
+                        }
+                        lines.append(line_data)
+                        
+                    elif item_type == "re":  # Rectangle
+                        rect = rect_to_dict(points[0])
+                        rect_area = rect["width"] * rect["height"]
+                        
+                        if rect_area < 1:
+                            continue
+                            
+                        rect_data = {
+                            "type": "rect", 
+                            "rect": rect,
+                            "area": rect_area,
+                            "color": path.get("color", [0, 0, 0]),
+                            "fill": path.get("fill", [])
+                        }
+                        rectangles.append(rect_data)
+                        
+                    elif item_type == "c":  # Curve
+                        curve_data = {
+                            "type": "curve", 
+                            "p1": point_to_dict(points[0]), 
+                            "p2": point_to_dict(points[1]), 
+                            "p3": point_to_dict(points[2]),
+                            "color": path.get("color", [0, 0, 0]),
+                            "width": round(path.get("width", 1), 2)
+                        }
+                        curves.append(curve_data)
+            
+            texts = []
+            for text_block in page.get_text(TEXT_BLOCKS_METHOD)["blocks"]:
+                if "lines" in text_block:
+                    for line in text_block["lines"]:
+                        for span in line["spans"]:
+                            text_data = {
+                                "text": span["text"],
+                                "position": {
+                                    "x": span["origin"][0],
+                                    "y": span["origin"][1]
+                                },
+                                "font_size": span["size"],
+                                "font_name": span["font"],
+                                "color": span.get("color", [0, 0, 0]),
+                                "bbox": rect_to_dict(span["bbox"])
+                            }
+                            texts.append(text_data)
+            
+            page_data = {
+                "page_number": req.page_number,
+                "page_size": {
+                    "width": round(page.rect.width, 2),
+                    "height": round(page.rect.height, 2)
+                },
+                "drawings": {
+                    "lines": lines,
+                    "rectangles": rectangles,
+                    "curves": curves
+                },
+                "texts": texts,
+                "is_vector": has_vector,
+                "processing_time_ms": int((time.time() - page_start_time) * 1000)
+            }
+            
+            outputs.append({
+                "data": page_data,
+                "url": req.url,
+                "summary": {
+                    "lines": len(lines),
+                    "rectangles": len(rectangles),
+                    "curves": len(curves),
+                    "texts": len(texts),
+                    "file_size_mb": round(len(pdf_bytes) / (1024 * 1024), 2),
+                    "processing_time_ms": page_data["processing_time_ms"]
+                }
+            })
+            
+            logger.info(f"Page {req.page_number} processed from URL {req.url}: {len(lines)} lines, {len(rectangles)} rectangles, "
+                       f"{len(texts)} texts [{MemoryMonitor.get_memory_usage():.1f} MB]")
+            
+            pdf_document.close()
+        
+        except Exception as e:
+            logger.error(f"Error processing URL {req.url}: {e}", exc_info=True)
+            outputs.append({"error": str(e), "url": req.url})
+    
+    return outputs
 
-# Models
-class InputBody(BaseModel):
-    fileUrl: HttpUrl = Field(..., description="URL of the PDF drawing")
-    fileName: Optional[str] = Field(None, description="Name of the file")
-
-class InputItem(BaseModel):
-    body: InputBody
-
-class MasterResponse(BaseModel):
-    vector_data: Dict[str, Any] = Field(..., description="Extracted vector data")
-    scale_data: List[Dict[str, Any]] = Field(..., description="Detected scale data")
-    message: str = Field(..., description="Processing status")
-    processing_time_ms: int = Field(..., description="Total processing time in milliseconds")
-
-# Configuration
-class MasterConfig:
-    def __init__(self):
-        self.vector_api_url = os.getenv("VECTOR_API_URL", "https://vector-api-0wlf.onrender.com/extract-vectors-from-urls/")
-        self.scale_api_url = os.getenv("SCALE_API_URL", "https://scale-api-5f65.onrender.com/detect-scale-from-json/")
-        self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", "30.0"))
-        self.max_file_size = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024
-
-config = MasterConfig()
-
-# Metrics
-request_count = 0
-error_count = 0
-total_processing_time = 0
-
-@app.middleware("http")
-async def add_request_id_and_metrics(request, call_next):
-    global request_count, total_processing_time, error_count
-    request_id = str(uuid.uuid4())
-    logger.info(f"Request {request_id}: {request.method} {request.url.path}")
+@app.post("/extract-vectors/")
+async def extract_vectors(file: UploadFile = File(...)):
+    """
+    Extract raw vector data and text from PDF file
+    No business logic - only data extraction
+    
+    Returns:
+        JSON with raw page data containing:
+        - drawings: vector paths, lines, rectangles, curves
+        - texts: text blocks with position and font info
+        - page_info: page dimensions and metadata
+    """
     start_time = time.time()
-    response = await call_next(request)
-    duration = (time.time() - start_time) * 1000
-    request_count += 1
-    total_processing_time += duration
-    if response.status_code >= 400:
-        error_count += 1
-    response.headers["X-Request-ID"] = request_id
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    return response
+    
+    try:
+        logger.info(f"Extracting vectors from: {file.filename} [{MemoryMonitor.get_memory_usage():.1f} MB]")
+        
+        # Read PDF file
+        pdf_bytes = await file.read()
+        if not pdf_bytes:
+            raise ValueError("Empty PDF file")
+            
+        pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        
+        if len(pdf_document) == 0:
+            raise ValueError("PDF contains no pages")
+            
+        logger.info(f"PDF loaded: {len(pdf_document)} pages, {len(pdf_bytes)/1024:.1f} KB")
+        
+        output = {
+            "pages": [],
+            "summary": {
+                "total_pages": len(pdf_document),
+                "total_lines": 0,
+                "total_rectangles": 0,
+                "total_curves": 0,
+                "total_texts": 0,
+                "file_size_mb": round(len(pdf_bytes) / (1024 * 1024), 2),
+                "processing_time_ms": 0
+            }
+        }
+        
+        for page_num, page in enumerate(pdf_document):
+            page_start_time = time.time()
+            logger.info(f"Processing page {page_num + 1} of {len(pdf_document)}")
+            
+            # Handle very large pages by extracting at a reasonable resolution
+            if page.rect.width > MAX_PAGE_SIZE or page.rect.height > MAX_PAGE_SIZE:
+                logger.warning(f"Very large page detected: {page.rect.width}x{page.rect.height}")
+                # Consider downscaling for extremely large pages
+            
+            # Check if page contains vector content
+            has_vector = is_vector_page(page)
+            logger.info(f"Page {page_num + 1} vector content: {has_vector}")
+            
+            # Extract all geometric elements
+            lines = []
+            rectangles = []
+            curves = []
+            
+            # Extract vector drawings
+            for path in page.get_drawings():
+                for item in path["items"]:
+                    item_type = item[0]
+                    points = item[1:]
+                    
+                    if item_type == "l":  # Line
+                        p1 = point_to_dict(points[0])
+                        p2 = point_to_dict(points[1])
+                        line_length = distance(p1, p2)
+                        
+                        # Skip very short lines that are likely noise
+                        if line_length < MIN_LINE_LENGTH:
+                            continue
+                            
+                        line_data = {
+                            "type": "line", 
+                            "p1": p1, 
+                            "p2": p2,
+                            "length": line_length,
+                            "color": path.get("color", [0, 0, 0]),
+                            "width": round(path.get("width", 1), 2)
+                        }
+                        lines.append(line_data)
+                        
+                    elif item_type == "re":  # Rectangle
+                        rect = rect_to_dict(points[0])
+                        rect_area = rect["width"] * rect["height"]
+                        
+                        # Skip very small rectangles that are likely noise
+                        if rect_area < 1:
+                            continue
+                            
+                        rect_data = {
+                            "type": "rect", 
+                            "rect": rect,
+                            "area": rect_area,
+                            "color": path.get("color", [0, 0, 0]),
+                            "fill": path.get("fill", [])
+                        }
+                        rectangles.append(rect_data)
+                        
+                    elif item_type == "c":  # Curve
+                        curve_data = {
+                            "type": "curve", 
+                            "p1": point_to_dict(points[0]), 
+                            "p2": point_to_dict(points[1]), 
+                            "p3": point_to_dict(points[2]),
+                            "color": path.get("color", [0, 0, 0]),
+                            "width": round(path.get("width", 1), 2)
+                        }
+                        curves.append(curve_data)
+            
+            # Extract text blocks
+            texts = []
+            for text_block in page.get_text(TEXT_BLOCKS_METHOD)["blocks"]:
+                if "lines" in text_block:
+                    for line in text_block["lines"]:
+                        for span in line["spans"]:
+                            text_data = {
+                                "text": span["text"],
+                                "position": {
+                                    "x": span["origin"][0],
+                                    "y": span["origin"][1]
+                                },
+                                "font_size": span["size"],
+                                "font_name": span["font"],
+                                "color": span.get("color", [0, 0, 0]),
+                                "bbox": rect_to_dict(span["bbox"])
+                            }
+                            texts.append(text_data)
+            
+            page_data = {
+                "page_number": page_num + 1,
+                "page_size": {
+                    "width": round(page.rect.width, 2),
+                    "height": round(page.rect.height, 2)
+                },
+                "drawings": {
+                    "lines": lines,
+                    "rectangles": rectangles,
+                    "curves": curves
+                },
+                "texts": texts,
+                "is_vector": has_vector,
+                "processing_time_ms": int((time.time() - page_start_time) * 1000)
+            }
+            
+            output["pages"].append(page_data)
+            
+            # Update summary
+            output["summary"]["total_lines"] += len(lines)
+            output["summary"]["total_rectangles"] += len(rectangles)
+            output["summary"]["total_curves"] += len(curves)
+            output["summary"]["total_texts"] += len(texts)
+            
+            logger.info(f"Page {page_num + 1} processed: {len(lines)} lines, {len(rectangles)} rectangles, "
+                       f"{len(texts)} texts [{MemoryMonitor.get_memory_usage():.1f} MB]")
+        
+        # Calculate total processing time
+        output["summary"]["processing_time_ms"] = int((time.time() - start_time) * 1000)
+        
+        logger.info(f"Vector extraction completed in {output['summary']['processing_time_ms']}ms: "
+                   f"{output['summary']['total_lines']} lines, {output['summary']['total_texts']} texts")
+        return output
+        
+    except Exception as e:
+        logger.error(f"Error during vector extraction: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/metrics/")
-async def get_metrics():
-    return {
-        "request_count": request_count,
-        "error_count": error_count,
-        "average_response_time_ms": total_processing_time / request_count if request_count > 0 else 0,
-        "uptime_seconds": (datetime.now() - app_start_time).total_seconds()
-    }
+@app.post("/vector-check/", response_model=VectorCheckResponse)
+async def vector_check(file: UploadFile = File(...), page: int = Query(1, ge=1)):
+    """
+    Check if a specific page in a PDF contains vector content
+    Used for vectorcheck as per the knowledge base
+    
+    Args:
+        file: PDF file to check
+        page: Page number to check (1-based)
+        
+    Returns:
+        JSON with vector check result
+    """
+    try:
+        logger.info(f"Checking vector content in {file.filename}, page {page}")
+        
+        # Read PDF file
+        pdf_bytes = await file.read()
+        if not pdf_bytes:
+            raise ValueError("Empty PDF file")
+            
+        pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        
+        if len(pdf_document) == 0:
+            raise ValueError("PDF contains no pages")
+            
+        if page > len(pdf_document):
+            raise ValueError(f"Page {page} does not exist in the document (total pages: {len(pdf_document)})")
+        
+        # Get the specified page (0-based index)
+        pdf_page = pdf_document[page-1]
+        
+        # Check if page contains vector content
+        has_vector = is_vector_page(pdf_page)
+        
+        return {
+            "page_number": page,
+            "is_vector": has_vector,
+            "page_url": None  # Can be populated by n8n workflow
+        }
+        
+    except Exception as e:
+        logger.error(f"Error during vector check: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 async def root():
-    """Root endpoint with API overview"""
+    """Root endpoint"""
     return {
-        "service": "Master API",
-        "version": "1.1.1",
-        "description": "Coordinates Vector Extraction and Scale Detection for construction drawings",
+        "message": "Vector Extraction API - Pure Data Extraction",
+        "version": "4.0.0",
         "endpoints": {
-            "process_drawing": "/process-drawing/",
-            "health": "/health/",
-            "metrics": "/metrics/",
-            "docs": "/docs/"
-        }
+            "/extract-vectors/": "Extract raw vector data from PDF file upload",
+            "/extract-vectors-from-urls/": "Extract raw vector data from PDFs at URLs (specific pages)",
+            "/vector-check/": "Check if a page contains vector content",
+            "/health/": "Health check"
+        },
+        "knowledge_base": "KENNISBANK BOUWTEKENING-ANALYSE V1.0 - Section 3: VECTORCHECK"
     }
 
 @app.get("/health/")
 async def health_check():
-    """Health check endpoint with diagnostics"""
-    memory = get_memory_usage()
+    """Health check endpoint"""
+    memory_usage = MemoryMonitor.get_memory_usage()
     return {
-        "status": "healthy",
-        "service": "master-api",
-        "version": "1.1.1",
-        "memory_usage_mb": round(memory, 2),
-        "timestamp": datetime.now().isoformat(),
-        "config": vars(config)
+        "status": "healthy", 
+        "service": "vector_api",
+        "memory_usage_mb": round(memory_usage, 1),
+        "timestamp": datetime.now().isoformat()
     }
-
-def get_memory_usage() -> float:
-    """Get current memory usage in MB"""
-    try:
-        import psutil
-        process = psutil.Process(os.getpid())
-        return process.memory_info().rss / 1024 / 1024
-    except (ImportError, AttributeError):
-        logger.warning("psutil not available or memory_info failed, memory monitoring disabled")
-        return 0.0
-
-async def cleanup_async(file_path: str, delay: float = 1.0):
-    """Clean up temporary files"""
-    await asyncio.sleep(delay)
-    try:
-        if os.path.exists(file_path):
-            os.unlink(file_path)
-    except Exception as e:
-        logger.error(f"Error during cleanup: {e}")
-
-@app.post("/process-drawing/", response_model=MasterResponse)
-async def process_drawing(request_items: List[InputItem], background_tasks: BackgroundTasks):
-    """Process a drawing by downloading PDF, extracting vector data, and calculating scale"""
-    start_time = time.time()
-    request_id = str(uuid.uuid4())
-
-    if len(request_items) != 1:
-        raise MasterProcessingError("Expected exactly one input item")
-
-    item = request_items[0]
-    url = str(item.body.fileUrl)
-    # file_name = item.body.fileName  # Not used currently
-    page_number = 1  # Default since not provided in input
-
-    logger.info(f"Processing drawing: {url}, page {page_number} [Request ID: {request_id}]")
-
-    # Step 1: Download PDF
-    try:
-        pdf_response = requests.get(url, timeout=config.request_timeout)
-        pdf_response.raise_for_status()
-        pdf_data = pdf_response.content
-        if len(pdf_data) > config.max_file_size:
-            raise MasterProcessingError(f"File too large. Maximum size is {config.max_file_size / 1024 / 1024}MB")
-        if not pdf_data.startswith(b'%PDF'):
-            raise MasterProcessingError("Invalid PDF file")
-        logger.info(f"Downloaded PDF: {len(pdf_data)} bytes")
-    except requests.RequestException as e:
-        logger.error(f"Error downloading PDF: {e}", exc_info=True)
-        raise MasterProcessingError(f"Failed to download PDF: {str(e)}")
-
-    # Step 2: Call Vector Extraction API
-    try:
-        vector_response = requests.post(
-            config.vector_api_url,
-            json=[{"url": url, "page_number": page_number}],
-            headers={"Content-Type": "application/json"},
-            timeout=config.request_timeout
-        )
-        vector_response.raise_for_status()
-        vector_data = vector_response.json()
-        if not vector_data or not isinstance(vector_data, list) or not vector_data[0].get("data"):
-            raise MasterProcessingError("Invalid vector data received")
-        logger.info(f"Vector data extracted: {len(vector_data[0]['data']['drawings']['lines'])} lines, "
-                   f"{len(vector_data[0]['data']['texts'])} texts")
-    except requests.RequestException as e:
-        logger.error(f"Error calling Vector API: {e}", exc_info=True)
-        raise MasterAPIError(f"Failed to call Vector API: {str(e)}")
-
-    # Step 3: Call Scale Detection API
-    try:
-        scale_response = requests.post(
-            config.scale_api_url,
-            json={"pages": [vector_data[0]["data"]], "summary": vector_data[0]["data"]},
-            headers={"Content-Type": "application/json"},
-            timeout=config.request_timeout
-        )
-        scale_response.raise_for_status()
-        scale_data = scale_response.json()
-        if not scale_data or scale_data[0].get("confidence", 0) == 0:
-            logger.warning("No reliable scale found")
-        else:
-            logger.info(f"Scale detected: {scale_data[0]['scale_ratio']} (confidence: {scale_data[0]['confidence']})")
-    except requests.RequestException as e:
-        logger.error(f"Error calling Scale API: {e}", exc_info=True)
-        raise MasterAPIError(f"Failed to call Scale API: {str(e)}")
-
-    processing_time_ms = int((time.time() - start_time) * 1000)
-    return MasterResponse(
-        vector_data=vector_data[0]["data"],
-        scale_data=scale_data,
-        message="Drawing processed successfully",
-        processing_time_ms=processing_time_ms
-    )
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
