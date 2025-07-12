@@ -61,7 +61,7 @@ class MasterConfig:
         self.vector_api_url = os.getenv("VECTOR_API_URL", "https://vector-api-0wlf.onrender.com/extract-vectors/")
         self.scale_api_url = os.getenv("SCALE_API_URL", "https://scale-api-5f65.onrender.com/detect-scale-from-json/")
         self.wall_api_url = os.getenv("WALL_API_URL", "https://wall-api.onrender.com/detect-walls/")
-        self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", "300.0"))
+        self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", "60.0"))
         self.max_file_size = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024
 
 config = MasterConfig()
