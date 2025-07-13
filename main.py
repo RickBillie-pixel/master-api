@@ -1,4 +1,4 @@
-# master.py (Rewritten to call Vector API for extraction, Scale API for scale, batch lines, send batches to Wall API, then validate)
+# master.py (Full rewritten Master API: handles list of requests from n8n, calls Vector/Scale APIs, batches lines, sends to Wall API, then validates)
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -22,75 +22,79 @@ app = FastAPI(
     version="2025-07",
 )
 
-# Service URLs (set as env vars or constants)
-VECTOR_API_URL = "https://vector-api-0wlf.onrender.com/extract-vector/"  
-SCALE_API_URL = "https://scale-api-5f65.onrender.com/detect-scale/"  
+# Service URLs
+VECTOR_API_URL = "https://vector-api-0wlf.onrender.com/extract-vector/"
+SCALE_API_URL = "https://scale-api-5f65.onrender.com/detect-scale/"
 WALL_DETECTION_URL = "https://wall-api.onrender.com/detect-walls/"
 VALIDATION_URL = "https://validation-api-21ha.onrender.com/validate-walls/"
 BATCH_SIZE = 5000  # Batch size for lines
 
-class ProcessRequest(BaseModel):
-    pdf_url: str
+class ProcessItem(BaseModel):
+    url: str
     page_number: int = 1
 
 @app.post("/process-drawing/")
-async def process_drawing(request: ProcessRequest):
-    request_id = str(uuid.uuid4())
-    try:
-        logger.info(f"Processing drawing: {request.pdf_url}, page {request.page_number} [Request ID: {request_id}]")
-        
-        # Step 1: Call Vector API to extract lines and texts
-        vector_response = requests.post(
-            VECTOR_API_URL,
-            json={"pdf_url": request.pdf_url, "page_number": request.page_number},
-            timeout=300
-        )
-        vector_response.raise_for_status()
-        vector_data = vector_response.json()
-        lines = vector_data.get("lines", [])  # Assuming response has "lines" and "texts"
-        texts = vector_data.get("texts", [])
-        logger.info(f"Vector data extracted: {len(lines)} lines, {len(texts)} texts")
-        
-        # Step 2: Call Scale API to detect scale
-        scale_response = requests.post(
-            SCALE_API_URL,
-            json={"texts": texts},
-            timeout=300
-        )
-        scale_response.raise_for_status()
-        scale_info = scale_response.json()
-        scale_m_per_pixel = scale_info["scale_m_per_pixel"]  # Assuming key in response
-        logger.info(f"Scale detected: {scale_info.get('scale', 'unknown')} (confidence: {scale_info.get('confidence', 0)})")
-        
-        # Step 3: Batch lines and call Wall Detection API for each batch
-        batches = [lines[i:i + BATCH_SIZE] for i in range(0, len(lines), BATCH_SIZE)]
-        all_walls = []
-        for batch_num, batch in enumerate(batches, 1):
-            logger.info(f"Processing batch {batch_num}/{len(batches)} with {len(batch)} lines")
-            wall_response = requests.post(
-                WALL_DETECTION_URL,
-                json={"indexed_lines": batch, "scale_m_per_pixel": scale_m_per_pixel, "texts": texts},
-                timeout=600
+async def process_drawing(requests: List[ProcessItem]):
+    results = []
+    for req in requests:
+        request_id = str(uuid.uuid4())
+        try:
+            logger.info(f"Processing drawing: {req.url}, page {req.page_number} [Request ID: {request_id}]")
+            
+            # Step 1: Call Vector API to extract lines and texts
+            vector_response = requests.post(
+                VECTOR_API_URL,
+                json={"pdf_url": req.url, "page_number": req.page_number},
+                timeout=300
             )
-            wall_response.raise_for_status()
-            batch_walls = wall_response.json()
-            all_walls.extend(batch_walls)
-        logger.info(f"Detected {len(all_walls)} walls across all batches")
-        
-        # Step 4: Call Validation API with all walls
-        validation_response = requests.post(
-            VALIDATION_URL,
-            json={"walls": all_walls},
-            timeout=300
-        )
-        validation_response.raise_for_status()
-        validated_walls = validation_response.json()["validated_walls"]
-        logger.info(f"Validation completed")
-        
-        return {"walls": validated_walls, "request_id": request_id}
-    except Exception as e:
-        logger.error(f"Error processing drawing: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+            vector_response.raise_for_status()
+            vector_data = vector_response.json()
+            lines = vector_data.get("lines", [])  # Assuming response has "lines" and "texts"
+            texts = vector_data.get("texts", [])
+            logger.info(f"Vector data extracted: {len(lines)} lines, {len(texts)} texts")
+            
+            # Step 2: Call Scale API to detect scale
+            scale_response = requests.post(
+                SCALE_API_URL,
+                json={"texts": texts},
+                timeout=300
+            )
+            scale_response.raise_for_status()
+            scale_info = scale_response.json()
+            scale_m_per_pixel = scale_info["scale_m_per_pixel"]  # Assuming key in response
+            logger.info(f"Scale detected: {scale_info.get('scale', 'unknown')} (confidence: {scale_info.get('confidence', 0)})")
+            
+            # Step 3: Batch lines and call Wall Detection API for each batch
+            batches = [lines[i:i + BATCH_SIZE] for i in range(0, len(lines), BATCH_SIZE)]
+            all_walls = []
+            for batch_num, batch in enumerate(batches, 1):
+                logger.info(f"Processing batch {batch_num}/{len(batches)} with {len(batch)} lines")
+                wall_response = requests.post(
+                    WALL_DETECTION_URL,
+                    json={"indexed_lines": batch, "scale_m_per_pixel": scale_m_per_pixel, "texts": texts},
+                    timeout=600
+                )
+                wall_response.raise_for_status()
+                batch_walls = wall_response.json()
+                all_walls.extend(batch_walls)
+            logger.info(f"Detected {len(all_walls)} walls across all batches")
+            
+            # Step 4: Call Validation API with all walls
+            validation_response = requests.post(
+                VALIDATION_URL,
+                json={"walls": all_walls},
+                timeout=300
+            )
+            validation_response.raise_for_status()
+            validated_walls = validation_response.json()["validated_walls"]
+            logger.info(f"Validation completed")
+            
+            results.append({"walls": validated_walls, "request_id": request_id, "url": req.url, "page_number": req.page_number})
+        except Exception as e:
+            logger.error(f"Error processing drawing {req.url}: {e}", exc_info=True)
+            results.append({"error": str(e), "url": req.url, "page_number": req.page_number})
+    
+    return results
 
 @app.get("/")
 async def root():
