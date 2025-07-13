@@ -1,615 +1,129 @@
-"""
+# master.py (Rewritten to call Vector API for extraction, Scale API for scale, batch lines, send batches to Wall API, then validate)
 
-Master API - Coordinates Vector Extraction, Scale Detection, and Wall Detection APIs
-
-Optimized for production-readiness and school project testing
-
-Downloads PDF, extracts vector data, calculates scale, and detects walls
-
-"""
-
-
-
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 import requests
-
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-
-from pydantic import BaseModel, HttpUrl, Field
-
-from typing import List, Dict, Any, Optional
-
 import logging
-
+from typing import List, Dict, Any
+import time
+from datetime import datetime
 import uuid
 
-from datetime import datetime
-
-import asyncio
-
-import os
-
-import time
-
-import redis
-
-import rq
-
-from rq import Queue
-
-
-
 # Configure logging
-
 logging.basicConfig(
-
     level=logging.INFO,
-
     format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
-
 )
-
 logger = logging.getLogger("master_api")
 
-
-
 app = FastAPI(
-
     title="Master API",
-
-    description="Coordinates Vector Extraction, Scale Detection, and Wall Detection for construction drawings",
-
-    version="1.2.0",
-
-    docs_url="/docs/",
-
-    openapi_url="/openapi.json"
-
+    description="Orchestrates PDF processing for wall detection",
+    version="2025-07",
 )
 
+# Service URLs (set as env vars or constants)
+VECTOR_API_URL = "https://vector-api-0wlf.onrender.com/extract-vector/"  
+SCALE_API_URL = "https://scale-api-5f65.onrender.com/detect-scale/"  
+WALL_DETECTION_URL = "https://wall-api.onrender.com/detect-walls/"
+VALIDATION_URL = "https://validation-api-21ha.onrender.com/validate-walls/"
+BATCH_SIZE = 5000  # Batch size for lines
 
+class ProcessRequest(BaseModel):
+    pdf_url: str
+    page_number: int = 1
 
-app_start_time = datetime.now()
-
-
-
-# Custom exceptions
-
-class MasterProcessingError(HTTPException):
-
-    """Exception for Master API processing errors"""
-
-    def __init__(self, detail: str = "Processing error"):
-
-        super().__init__(status_code=400, detail=detail)
-
-
-
-class MasterAPIError(HTTPException):
-
-    """Exception for downstream API failures"""
-
-    def __init__(self, detail: str = "Downstream API error"):
-
-        super().__init__(status_code=500, detail=detail)
-
-
-
-# Models
-
-class DrawingRequest(BaseModel):
-
-    url: HttpUrl = Field(..., description="URL of the PDF drawing")
-
-    page_number: int = Field(..., ge=1, description="Page number to process")
-
-
-
-class MasterResponse(BaseModel):
-
-    vector_data: Dict[str, Any] = Field(..., description="Extracted vector data")
-
-    scale_data: List[Dict[str, Any]] = Field(..., description="Detected scale data")
-
-    wall_data: List[Dict[str, Any]] = Field(..., description="Detected wall data")
-
-    message: str = Field(..., description="Processing status")
-
-    processing_time_ms: int = Field(..., description="Total processing time in milliseconds")
-
-
-
-# Configuration
-
-class MasterConfig:
-
-    def __init__(self):
-
-        self.vector_api_url = os.getenv("VECTOR_API_URL", "https://vector-api-0wlf.onrender.com/extract-vectors/")
-
-        self.scale_api_url = os.getenv("SCALE_API_URL", "https://scale-api-5f65.onrender.com/detect-scale-from-json/")
-
-        self.preprocess_api_url = os.getenv("PREPROCESS_API_URL", "https://preprocess-api.onrender.com/preprocess/")
-
-        self.wall_detection_api_url = os.getenv("WALL_DETECTION_API_URL", "https://wall-detection-api.onrender.com/detect-walls/")
-
-        self.validation_api_url = os.getenv("VALIDATION_API_URL", "https://validation-api.onrender.com/validate-walls/")
-
-        self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", "300.0"))
-
-        self.max_file_size = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024
-
-        self.redis_host = os.getenv("REDIS_HOST", "redis-host")
-
-        self.redis_port = int(os.getenv("REDIS_PORT", 6379))
-
-        self.redis_password = os.getenv("REDIS_PASSWORD", "")
-
-
-
-config = MasterConfig()
-
-
-
-# Metrics
-
-request_count = 0
-
-error_count = 0
-
-total_processing_time = 0
-
-
-
-@app.middleware("http")
-
-async def add_request_id_and_metrics(request, call_next):
-
-    global request_count, total_processing_time, error_count
-
+@app.post("/process-drawing/")
+async def process_drawing(request: ProcessRequest):
     request_id = str(uuid.uuid4())
-
-    logger.info(f"Request {request_id}: {request.method} {request.url.path}")
-
-    start_time = time.time()
-
-    response = await call_next(request)
-
-    duration = (time.time() - start_time) * 1000
-
-    request_count += 1
-
-    total_processing_time += duration
-
-    if response.status_code >= 400:
-
-        error_count += 1
-
-    response.headers["X-Request-ID"] = request_id
-
-    response.headers["X-Content-Type-Options"] = "nosniff"
-
-    response.headers["X-Frame-Options"] = "DENY"
-
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-
-    return response
-
-
-
-@app.get("/metrics/")
-
-async def get_metrics():
-
-    return {
-
-        "request_count": request_count,
-
-        "error_count": error_count,
-
-        "average_response_time_ms": total_processing_time / request_count if request_count > 0 else 0,
-
-        "uptime_seconds": (datetime.now() - app_start_time).total_seconds()
-
-    }
-
-
+    try:
+        logger.info(f"Processing drawing: {request.pdf_url}, page {request.page_number} [Request ID: {request_id}]")
+        
+        # Step 1: Call Vector API to extract lines and texts
+        vector_response = requests.post(
+            VECTOR_API_URL,
+            json={"pdf_url": request.pdf_url, "page_number": request.page_number},
+            timeout=300
+        )
+        vector_response.raise_for_status()
+        vector_data = vector_response.json()
+        lines = vector_data.get("lines", [])  # Assuming response has "lines" and "texts"
+        texts = vector_data.get("texts", [])
+        logger.info(f"Vector data extracted: {len(lines)} lines, {len(texts)} texts")
+        
+        # Step 2: Call Scale API to detect scale
+        scale_response = requests.post(
+            SCALE_API_URL,
+            json={"texts": texts},
+            timeout=300
+        )
+        scale_response.raise_for_status()
+        scale_info = scale_response.json()
+        scale_m_per_pixel = scale_info["scale_m_per_pixel"]  # Assuming key in response
+        logger.info(f"Scale detected: {scale_info.get('scale', 'unknown')} (confidence: {scale_info.get('confidence', 0)})")
+        
+        # Step 3: Batch lines and call Wall Detection API for each batch
+        batches = [lines[i:i + BATCH_SIZE] for i in range(0, len(lines), BATCH_SIZE)]
+        all_walls = []
+        for batch_num, batch in enumerate(batches, 1):
+            logger.info(f"Processing batch {batch_num}/{len(batches)} with {len(batch)} lines")
+            wall_response = requests.post(
+                WALL_DETECTION_URL,
+                json={"indexed_lines": batch, "scale_m_per_pixel": scale_m_per_pixel, "texts": texts},
+                timeout=600
+            )
+            wall_response.raise_for_status()
+            batch_walls = wall_response.json()
+            all_walls.extend(batch_walls)
+        logger.info(f"Detected {len(all_walls)} walls across all batches")
+        
+        # Step 4: Call Validation API with all walls
+        validation_response = requests.post(
+            VALIDATION_URL,
+            json={"walls": all_walls},
+            timeout=300
+        )
+        validation_response.raise_for_status()
+        validated_walls = validation_response.json()["validated_walls"]
+        logger.info(f"Validation completed")
+        
+        return {"walls": validated_walls, "request_id": request_id}
+    except Exception as e:
+        logger.error(f"Error processing drawing: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
-
 async def root():
-
-    """Root endpoint with API overview"""
-
-    return {
-
-        "service": "Master API",
-
-        "version": "1.2.0",
-
-        "description": "Coordinates Vector Extraction, Scale Detection, and Wall Detection for construction drawings",
-
-        "endpoints": {
-
-            "process_drawing": "/process-drawing/",
-
-            "health": "/health/",
-
-            "metrics": "/metrics/",
-
-            "docs": "/docs/"
-
-        }
-
-    }
-
-
+    return {"message": "Master API", "version": "2025-07"}
 
 @app.get("/health/")
-
 async def health_check():
-
-    """Health check endpoint with diagnostics"""
-
-    memory = get_memory_usage()
-
-    return {
-
-        "status": "healthy",
-
-        "service": "master-api",
-
-        "version": "1.2.0",
-
-        "memory_usage_mb": round(memory, 2),
-
-        "timestamp": datetime.now().isoformat(),
-
-        "config": vars(config)
-
-    }
-
-
-
-def get_memory_usage() -> float:
-
-    """Get current memory usage in MB"""
-
-    try:
-
-        import psutil
-
-        process = psutil.Process(os.getpid())
-
-        return process.memory_info().rss / 1024 / 1024
-
-    except (ImportError, AttributeError):
-
-        logger.warning("psutil not available or memory_info failed, memory monitoring disabled")
-
-        return 0.0
-
-
-
-async def cleanup_async(file_path: str, delay: float = 1.0):
-
-    """Clean up temporary files"""
-
-    await asyncio.sleep(delay)
-
-    try:
-
-        if os.path.exists(file_path):
-
-            os.unlink(file_path)
-
-    except Exception as e:
-
-        logger.error(f"Error during cleanup: {e}")
-
-
-
-@app.post("/process-drawing/", response_model=MasterResponse)
-
-async def process_drawing(request_items: List[DrawingRequest], background_tasks: BackgroundTasks):
-
-    """Process a drawing by downloading PDF, extracting vector data, calculating scale, and detecting walls"""
-
-    start_time = time.time()
-
-    request_id = str(uuid.uuid4())
-
-
-
-    if len(request_items) != 1:
-
-        raise MasterProcessingError("Expected exactly one input item")
-
-
-
-    item = request_items[0]
-
-    url = str(item.url)
-
-    page_number = item.page_number
-
-
-
-    logger.info(f"Processing drawing: {url}, page {page_number} [Request ID: {request_id}]")
-
-
-
-    # Step 1: Download PDF
-
-    try:
-
-        pdf_response = requests.get(url, timeout=config.request_timeout)
-
-        pdf_response.raise_for_status()
-
-        pdf_data = pdf_response.content
-
-        if len(pdf_data) > config.max_file_size:
-
-            raise MasterProcessingError(f"File too large. Maximum size is {config.max_file_size / 1024 / 1024}MB")
-
-        if not pdf_data.startswith(b'%PDF'):
-
-            raise MasterProcessingError("Invalid PDF file")
-
-        logger.info(f"Downloaded PDF: {len(pdf_data)} bytes")
-
-    except requests.RequestException as e:
-
-        logger.error(f"Error downloading PDF: {e}", exc_info=True)
-
-        raise MasterProcessingError(f"Failed to download PDF: {str(e)}")
-
-
-
-    # Step 2: Call Vector Extraction API with PDF file
-
-    try:
-
-        vector_response = requests.post(
-
-            config.vector_api_url,
-
-            files={"file": ("drawing.pdf", pdf_data, "application/pdf")},
-
-            timeout=config.request_timeout
-
-        )
-
-        vector_response.raise_for_status()
-
-        vector_data = vector_response.json()
-
-        if not vector_data or not vector_data.get("pages"):
-
-            raise MasterProcessingError("Invalid vector data received")
-
-        vector_page = vector_data["pages"][0]
-
-        logger.info(f"Vector data extracted: {vector_data['summary']['total_lines']} lines, "
-
-                   f"{vector_data['summary']['total_texts']} texts")
-
-    except requests.RequestException as e:
-
-        logger.error(f"Error calling Vector API: {e}", exc_info=True)
-
-        raise MasterAPIError(f"Failed to call Vector API: {str(e)}")
-
-
-
-    # Step 3: Call Scale Detection API with vector data
-
-    try:
-
-        scale_json = {"pages": [vector_page], "summary": vector_data["summary"]}
-
-        scale_response = requests.post(
-
-            config.scale_api_url,
-
-            json=scale_json,
-
-            headers={"Content-Type": "application/json"},
-
-            timeout=config.request_timeout
-
-        )
-
-        scale_response.raise_for_status()
-
-        scale_data = scale_response.json()
-
-        if not scale_data or scale_data[0].get("confidence", 0) == 0:
-
-            logger.warning("No reliable scale found")
-
-            scale_m_per_pixel = 1.0  # Fallback to avoid division by zero
-
-        else:
-
-            logger.info(f"Scale detected: {scale_data[0]['scale_ratio']} (confidence: {scale_data[0]['confidence']})")
-
-            scale_m_per_pixel = scale_data[0]["real_meters_per_drawn_cm"] / 28.346  # Convert cm to points
-
-    except requests.RequestException as e:
-
-        logger.error(f"Error calling Scale API: {e}", exc_info=True)
-
-        raise MasterAPIError(f"Failed to call Scale API: {str(e)}")
-
-
-
-    # Step 4: Preprocessing
-
-    try:
-
-        preprocess_json = {"pages": [vector_page], "scale_m_per_pixel": scale_m_per_pixel}
-
-        preprocess_response = requests.post(
-
-            config.preprocess_api_url,
-
-            json=preprocess_json,
-
-            headers={"Content-Type": "application/json"},
-
-            timeout=config.request_timeout
-
-        )
-
-        preprocess_response.raise_for_status()
-
-        preprocess_data = preprocess_response.json()
-
-        logger.info(f"Preprocessing complete")
-
-    except requests.RequestException as e:
-
-        logger.error(f"Error calling Preprocessing API: {e}", exc_info=True)
-
-        raise MasterAPIError(f"Failed to call Preprocessing API: {str(e)}")
-
-
-
-    # Step 5: Batch Wall Detection
-
-    try:
-
-        wall_data = []
-
-        with redis.Redis(host=config.redis_host, port=config.redis_port, password=config.redis_password) as conn:
-
-            q = Queue(connection=conn)
-
-            chunks = [preprocess_data["indexed_lines"][i:i+10000] for i in range(0, len(preprocess_data["indexed_lines"]), 10000)]
-
-            jobs = []
-
-            for chunk in chunks:
-
-                job = q.enqueue(detect_walls_batch, (chunk, scale_m_per_pixel, vector_page["texts"]))
-
-                jobs.append(job)
-
-            for job in jobs:
-
-                job.wait()
-
-                wall_data.extend(job.result)
-
-        logger.info(f"Wall data detected: {len(wall_data)} walls")
-
-    except Exception as e:
-
-        logger.error(f"Error in Wall Detection batching: {e}", exc_info=True)
-
-        raise MasterAPIError(f"Failed in Wall Detection batching: {str(e)}")
-
-
-
-    # Step 6: Validation
-
-    try:
-
-        validation_response = requests.post(
-
-            config.validation_api_url,
-
-            json={"walls": wall_data},
-
-            headers={"Content-Type": "application/json"},
-
-            timeout=config.request_timeout
-
-        )
-
-        validation_response.raise_for_status()
-
-        validated_wall_data = validation_response.json()["validated_walls"]
-
-        logger.info(f"Validation complete")
-
-    except requests.RequestException as e:
-
-        logger.error(f"Error calling Validation API: {e}", exc_info=True)
-
-        raise MasterAPIError(f"Failed to call Validation API: {str(e)}")
-
-
-
-    processing_time_ms = int((time.time() - start_time) * 1000)
-
-    return MasterResponse(
-
-        vector_data=vector_page,
-
-        scale_data=scale_data,
-
-        wall_data=validated_wall_data,
-
-        message="Drawing processed successfully",
-
-        processing_time_ms=processing_time_ms
-
-    )
-
-
+    return {"status": "healthy", "service": "master_api", "version": "2025-07", "timestamp": datetime.now().isoformat()}
 
 if __name__ == "__main__":
-
     import uvicorn
-
     from gunicorn.app.base import BaseApplication
-
     import os
 
-
-
     class StandaloneApplication(BaseApplication):
-
         def __init__(self, app, options=None):
-
             self.application = app
-
             self.options = options or {}
-
             super().__init__()
 
-
-
         def load_config(self):
-
             for key, value in self.options.items():
-
                 if key in self.cfg.settings and value is not None:
-
                     self.cfg.set(key.lower(), value)
 
-
-
         def load(self):
-
             return self.application
 
-
-
     port = int(os.environ.get("PORT", 8000))
-
     options = {
-
-        "bind": "0.0.0.0:" + str(port),
-
+        "bind": f"0.0.0.0:{port}",
         "workers": 4,
-
         "worker_class": "uvicorn.workers.UvicornWorker",
-
-        "timeout": 300  # Set timeout to 300 seconds
-
+        "timeout": 300
     }
-
     StandaloneApplication(app, options).run()
