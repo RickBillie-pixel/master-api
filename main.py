@@ -1,139 +1,144 @@
-# master.py (Full Master API: handles list from n8n, downloads PDF, calls Vector with URL, Scale with texts, batches lines to Wall with scale/texts, validates all)
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import requests
+import fitz  # PyMuPDF
+import json
+from typing import Dict, List, Optional
 import logging
-from typing import List, Dict, Any
-import time
-from datetime import datetime
-import uuid
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
-)
-logger = logging.getLogger("master_api")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Master API",
-    description="Orchestrates PDF processing for wall detection",
-    version="2025-07",
-)
+def extract_vector_data(pdf_path: str, page_number: int) -> Dict:
+    """Extract vector data (lines, texts) from a specific PDF page."""
+    try:
+        # Open PDF
+        doc = fitz.open(pdf_path)
+        if page_number < 0 or page_number >= len(doc):
+            raise ValueError(f"Invalid page number: {page_number}")
+        
+        # Get page
+        page = doc.load_page(page_number)
+        page_width, page_height = page.rect.width, page.rect.height
 
-# Service URLs
-VECTOR_API_URL = "https://vector-api-0wlf.onrender.com/extract-vector/"
-SCALE_API_URL = "https://scale-api-5f65.onrender.com/detect-scale/"
-WALL_DETECTION_URL = "https://wall-api.onrender.com/detect-walls/"
-VALIDATION_URL = "https://validation-api-21ha.onrender.com/validate-walls/"
-BATCH_SIZE = 5000  # Batch size for lines
+        # Extract drawings (vector data)
+        drawings = page.get_drawings()
+        lines = []
+        texts = []
 
-class ProcessItem(BaseModel):
-    url: str
-    page_number: int = 1
+        for drawing in drawings:
+            for item in drawing["items"]:
+                if item[0] == "l":  # Line
+                    x0, y0, x1, y1 = item[1]
+                    length = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+                    lines.append({
+                        "type": "line",
+                        "p1": {"x": x0, "y": y0},
+                        "p2": {"x": x1, "y": y1},
+                        "length": length,
+                        "color": item[2][:3] if len(item[2]) >= 3 else [0, 0, 0],
+                        "width": item[2][3] if len(item[2]) > 3 else 0.0
+                    })
+                # Note: Other shapes (curves, rects) ignored as per focus on lines
 
-@app.post("/process-drawing/")
-async def process_drawing(pdf_items: List[ProcessItem]):
-    results = []
-    for item in pdf_items:
-        request_id = str(uuid.uuid4())
-        try:
-            logger.info(f"Processing drawing: {item.url}, page {item.page_number} [Request ID: {request_id}]")
-            
-            # Download PDF (for logging/verification; Vector API uses URL)
-            pdf_response = requests.get(item.url)
-            pdf_response.raise_for_status()
-            pdf_bytes = pdf_response.content
-            logger.info(f"Downloaded PDF: {len(pdf_bytes)} bytes")
-            
-            # Step 1: Call Vector API with URL to extract lines and texts
-            vector_response = requests.post(
-                VECTOR_API_URL,
-                json={"pdf_url": item.url, "page_number": item.page_number},
-                timeout=300
-            )
-            vector_response.raise_for_status()
-            vector_data = vector_response.json()
-            lines = vector_data.get("lines", [])  # Assuming keys in response
-            texts = vector_data.get("texts", [])
-            logger.info(f"Vector data extracted: {len(lines)} lines, {len(texts)} texts")
-            
-            # Step 2: Call Scale API with texts to detect scale
-            scale_response = requests.post(
-                SCALE_API_URL,
-                json={"texts": texts},
-                timeout=300
-            )
-            scale_response.raise_for_status()
-            scale_info = scale_response.json()
-            scale_m_per_pixel = scale_info["scale_m_per_pixel"]  # Assuming key
-            logger.info(f"Scale detected: {scale_info.get('scale', 'unknown')} (confidence: {scale_info.get('confidence', 0)})")
-            
-            # Step 3: Batch lines and call Wall Detection API for each batch with lines, scale, texts
-            batches = [lines[i:i + BATCH_SIZE] for i in range(0, len(lines), BATCH_SIZE)]
-            all_walls = []
-            for batch_num, batch in enumerate(batches, 1):
-                logger.info(f"Processing batch {batch_num}/{len(batches)} with {len(batch)} lines")
-                wall_response = requests.post(
-                    WALL_DETECTION_URL,
-                    json={"indexed_lines": batch, "scale_m_per_pixel": scale_m_per_pixel, "texts": texts},
-                    timeout=600
-                )
-                wall_response.raise_for_status()
-                batch_walls = wall_response.json()
-                all_walls.extend(batch_walls)
-            logger.info(f"Detected {len(all_walls)} walls across all batches")
-            
-            # Step 4: Call Validation API with all walls
-            validation_response = requests.post(
-                VALIDATION_URL,
-                json={"walls": all_walls},
-                timeout=300
-            )
-            validation_response.raise_for_status()
-            validated_walls = validation_response.json()["validated_walls"]
-            logger.info(f"Validation completed")
-            
-            results.append({"walls": validated_walls, "request_id": request_id, "url": item.url, "page_number": item.page_number})
-        except Exception as e:
-            logger.error(f"Error processing drawing {item.url}: {e}", exc_info=True)
-            results.append({"error": str(e), "url": item.url, "page_number": item.page_number})
-    
-    return results
+        # Extract text
+        text_blocks = page.get_text("dict")["blocks"]
+        for block in text_blocks:
+            if "lines" in block:
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        texts.append({
+                            "text": span["text"].strip(),
+                            "position": {"x": span["bbox"][0], "y": span["bbox"][1]},
+                            "font_size": span["size"],
+                            "font_name": span["font"],
+                            "color": span["color"],
+                            "bbox": {
+                                "x0": span["bbox"][0],
+                                "y0": span["bbox"][1],
+                                "x1": span["bbox"][2],
+                                "y1": span["bbox"][3],
+                                "width": span["bbox"][2] - span["bbox"][0],
+                                "height": span["bbox"][3] - span["bbox"][1]
+                            }
+                        })
 
-@app.get("/")
-async def root():
-    return {"message": "Master API", "version": "2025-07"}
+        return {
+            "page_number": page_number + 1,
+            "page_size": {"width": page_width, "height": page_height},
+            "drawings": {"lines": lines, "texts": texts},
+            "is_vector": bool(lines),  # True if vector data present
+            "processing_time_ms": 0  # Placeholder, replace with actual timing if needed
+        }
 
-@app.get("/health/")
-async def health_check():
-    return {"status": "healthy", "service": "master_api", "version": "2025-07", "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Error extracting vector data: {str(e)}")
+        return {"error": str(e), "page_number": page_number + 1}
+
+def extract_scale_data(pdf_path: str, page_number: int) -> Dict:
+    """Extract scale data from text on a specific PDF page."""
+    try:
+        doc = fitz.open(pdf_path)
+        if page_number < 0 or page_number >= len(doc):
+            raise ValueError(f"Invalid page number: {page_number}")
+        
+        page = doc.load_page(page_number)
+        text = page.get_text("text")
+
+        # Simple scale detection (e.g., "1:50", "1:20")
+        scale_ratios = {"1:50": 0.02, "1:20": 0.05}  # m/pixel approximations
+        detected_scale = None
+        confidence = 0.0
+
+        for ratio, scale in scale_ratios.items():
+            if ratio in text:
+                detected_scale = scale
+                confidence = 0.95  # High confidence for text match
+                break
+
+        if not detected_scale:
+            # Fallback: Infer from common scale if no match
+            detected_scale = 0.02  # Default to 1:50
+            confidence = 0.5  # Low confidence
+
+        return {
+            "scale": detected_scale,
+            "scale_ratio": [k for k, v in scale_ratios.items() if v == detected_scale][0],
+            "real_meters_per_drawn_cm": detected_scale * 100,  # Approx conversion
+            "method": "text_extraction" if confidence > 0.7 else "inference",
+            "unit": "m",
+            "message": f"Scale found in {('text_extraction' if confidence > 0.7 else 'inference')}: {scale_ratios}",
+            "confidence": confidence,
+            "validation": {"status": True, "reason": "Text reliable" if confidence > 0.7 else "Inferred"},
+            "page_number": page_number + 1,
+            "version": "2025-07"
+        }
+
+    except Exception as e:
+        logger.error(f"Error extracting scale data: {str(e)}")
+        return {"error": str(e), "page_number": page_number + 1}
+
+def process_drawing(pdf_path: str, page_number: int) -> Dict:
+    """Process PDF page to extract vector and scale data."""
+    vector_data = extract_vector_data(pdf_path, page_number)
+    scale_data = extract_scale_data(pdf_path, page_number)
+
+    if "error" in vector_data or "error" in scale_data:
+        return {
+            "message": "Drawing processing failed",
+            "vector_data": vector_data,
+            "scale_data": scale_data,
+            "processing_time_ms": 0
+        }
+
+    return {
+        "vector_data": vector_data,
+        "scale_data": [scale_data],
+        "message": "Drawing processed successfully",
+        "processing_time_ms": 0  # Replace with actual timing
+    }
 
 if __name__ == "__main__":
-    import uvicorn
-    from gunicorn.app.base import BaseApplication
-    import os
-
-    class StandaloneApplication(BaseApplication):
-        def __init__(self, app, options=None):
-            self.application = app
-            self.options = options or {}
-            super().__init__()
-
-        def load_config(self):
-            for key, value in self.options.items():
-                if key in self.cfg.settings and value is not None:
-                    self.cfg.set(key.lower(), value)
-
-        def load(self):
-            return self.application
-
-    port = int(os.environ.get("PORT", 8000))
-    options = {
-        "bind": f"0.0.0.0:{port}",
-        "workers": 4,
-        "worker_class": "uvicorn.workers.UvicornWorker",
-        "timeout": 300
-    }
-    StandaloneApplication(app, options).run()
+    # Example usage
+    pdf_path = "example.pdf"
+    page_number = 0
+    result = process_drawing(pdf_path, page_number)
+    print(json.dumps(result, indent=2))
