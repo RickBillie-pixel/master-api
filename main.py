@@ -1,4 +1,4 @@
-# master.py (Fixed: renamed parameter to 'pdf_requests' to avoid shadowing 'requests' module; handles list from n8n; downloads PDF but sends URL to vector API as per original)
+# master.py (Full Master API: handles list from n8n, downloads PDF, calls Vector with URL, Scale with texts, batches lines to Wall with scale/texts, validates all)
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -34,32 +34,32 @@ class ProcessItem(BaseModel):
     page_number: int = 1
 
 @app.post("/process-drawing/")
-async def process_drawing(pdf_requests: List[ProcessItem]):
+async def process_drawing(pdf_items: List[ProcessItem]):
     results = []
-    for req in pdf_requests:
+    for item in pdf_items:
         request_id = str(uuid.uuid4())
         try:
-            logger.info(f"Processing drawing: {req.url}, page {req.page_number} [Request ID: {request_id}]")
+            logger.info(f"Processing drawing: {item.url}, page {item.page_number} [Request ID: {request_id}]")
             
-            # Download PDF (as per your instruction, though vector API handles URL; we can log size or use if needed)
-            pdf_response = requests.get(req.url)
+            # Download PDF (for logging/verification; Vector API uses URL)
+            pdf_response = requests.get(item.url)
             pdf_response.raise_for_status()
             pdf_bytes = pdf_response.content
             logger.info(f"Downloaded PDF: {len(pdf_bytes)} bytes")
             
-            # Step 1: Call Vector API (sends URL, assumes it downloads internally; if needs bytes, adjust to multipart)
+            # Step 1: Call Vector API with URL to extract lines and texts
             vector_response = requests.post(
                 VECTOR_API_URL,
-                json={"pdf_url": req.url, "page_number": req.page_number},
+                json={"pdf_url": item.url, "page_number": item.page_number},
                 timeout=300
             )
             vector_response.raise_for_status()
             vector_data = vector_response.json()
-            lines = vector_data.get("lines", [])  # Assuming response has "lines" and "texts"
+            lines = vector_data.get("lines", [])  # Assuming keys in response
             texts = vector_data.get("texts", [])
             logger.info(f"Vector data extracted: {len(lines)} lines, {len(texts)} texts")
             
-            # Step 2: Call Scale API with texts from vector data
+            # Step 2: Call Scale API with texts to detect scale
             scale_response = requests.post(
                 SCALE_API_URL,
                 json={"texts": texts},
@@ -67,7 +67,7 @@ async def process_drawing(pdf_requests: List[ProcessItem]):
             )
             scale_response.raise_for_status()
             scale_info = scale_response.json()
-            scale_m_per_pixel = scale_info["scale_m_per_pixel"]  # Assuming key in response
+            scale_m_per_pixel = scale_info["scale_m_per_pixel"]  # Assuming key
             logger.info(f"Scale detected: {scale_info.get('scale', 'unknown')} (confidence: {scale_info.get('confidence', 0)})")
             
             # Step 3: Batch lines and call Wall Detection API for each batch with lines, scale, texts
@@ -95,10 +95,10 @@ async def process_drawing(pdf_requests: List[ProcessItem]):
             validated_walls = validation_response.json()["validated_walls"]
             logger.info(f"Validation completed")
             
-            results.append({"walls": validated_walls, "request_id": request_id, "url": req.url, "page_number": req.page_number})
+            results.append({"walls": validated_walls, "request_id": request_id, "url": item.url, "page_number": item.page_number})
         except Exception as e:
-            logger.error(f"Error processing drawing {req.url}: {e}", exc_info=True)
-            results.append({"error": str(e), "url": req.url, "page_number": req.page_number})
+            logger.error(f"Error processing drawing {item.url}: {e}", exc_info=True)
+            results.append({"error": str(e), "url": item.url, "page_number": item.page_number})
     
     return results
 
