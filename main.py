@@ -1,12 +1,13 @@
 """
 Master API - Orchestrates PDF Processing
 Downloads PDF pages from URLs, extracts vectors, and detects scales
+Includes full vector data in the response for n8n integration
 """
 
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List
+from typing import List, Dict, Any
 import logging
 from datetime import datetime
 import os
@@ -20,8 +21,8 @@ logger = logging.getLogger("master_api")
 
 app = FastAPI(
     title="Master PDF Processing API",
-    description="Orchestrates PDF download, vector extraction, and scale detection",
-    version="1.0.0"
+    description="Downloads PDF pages, extracts vectors, detects scales, and returns both vector and scale data",
+    version="1.0.1"
 )
 
 class PageInput(BaseModel):
@@ -29,7 +30,8 @@ class PageInput(BaseModel):
     page_number: int
 
 class ProcessResponse(BaseModel):
-    scales: List[dict]
+    vector_data: Dict[str, Any]
+    scales: List[Dict[str, Any]]
     message: str
     timestamp: str
 
@@ -44,6 +46,7 @@ async def process_pdf(inputs: List[PageInput]):
     2. Extract vectors for each page
     3. Combine into single vector data
     4. Send to scale detection
+    5. Return both vector data and scale results
     """
     if not inputs:
         raise HTTPException(status_code=400, detail="No input pages provided")
@@ -112,9 +115,22 @@ async def process_pdf(inputs: List[PageInput]):
         scale_data = scale_resp.json()
     except Exception as e:
         logger.error(f"Scale detection failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Scale detection failed: {str(e)}")
+        scale_data = [{
+            "scale": None,
+            "scale_ratio": None,
+            "real_meters_per_drawn_cm": None,
+            "method": "none",
+            "unit": None,
+            "message": f"Scale detection failed: {str(e)}",
+            "confidence": 0.0,
+            "validation": {"status": False, "reason": "Scale detection error"},
+            "page_number": 0,
+            "viewport_id": None,
+            "version": "2025-07"
+        }]
     
     return ProcessResponse(
+        vector_data=vector_full,
         scales=scale_data,
         message="Processing completed successfully",
         timestamp=datetime.now().isoformat()
@@ -126,7 +142,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "master-api",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "timestamp": datetime.now().isoformat()
     }
 
@@ -135,8 +151,8 @@ async def root():
     """Root endpoint"""
     return {
         "service": "Master PDF Processing API",
-        "version": "1.0.0",
-        "description": "Downloads PDF pages, extracts vectors, and detects scales",
+        "version": "1.0.1",
+        "description": "Downloads PDF pages, extracts vectors, detects scales, and returns both vector and scale data",
         "endpoints": {
             "process_pdf": "/process-pdf/",
             "health": "/health"
