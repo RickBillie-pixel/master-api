@@ -1,4 +1,4 @@
-# master.py (Full rewritten Master API: handles list of requests from n8n, calls Vector/Scale APIs, batches lines, sends to Wall API, then validates)
+# master.py (Fixed: renamed parameter to 'pdf_requests' to avoid shadowing 'requests' module; handles list from n8n; downloads PDF but sends URL to vector API as per original)
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -34,14 +34,20 @@ class ProcessItem(BaseModel):
     page_number: int = 1
 
 @app.post("/process-drawing/")
-async def process_drawing(requests: List[ProcessItem]):
+async def process_drawing(pdf_requests: List[ProcessItem]):
     results = []
-    for req in requests:
+    for req in pdf_requests:
         request_id = str(uuid.uuid4())
         try:
             logger.info(f"Processing drawing: {req.url}, page {req.page_number} [Request ID: {request_id}]")
             
-            # Step 1: Call Vector API to extract lines and texts
+            # Download PDF (as per your instruction, though vector API handles URL; we can log size or use if needed)
+            pdf_response = requests.get(req.url)
+            pdf_response.raise_for_status()
+            pdf_bytes = pdf_response.content
+            logger.info(f"Downloaded PDF: {len(pdf_bytes)} bytes")
+            
+            # Step 1: Call Vector API (sends URL, assumes it downloads internally; if needs bytes, adjust to multipart)
             vector_response = requests.post(
                 VECTOR_API_URL,
                 json={"pdf_url": req.url, "page_number": req.page_number},
@@ -53,7 +59,7 @@ async def process_drawing(requests: List[ProcessItem]):
             texts = vector_data.get("texts", [])
             logger.info(f"Vector data extracted: {len(lines)} lines, {len(texts)} texts")
             
-            # Step 2: Call Scale API to detect scale
+            # Step 2: Call Scale API with texts from vector data
             scale_response = requests.post(
                 SCALE_API_URL,
                 json={"texts": texts},
@@ -64,7 +70,7 @@ async def process_drawing(requests: List[ProcessItem]):
             scale_m_per_pixel = scale_info["scale_m_per_pixel"]  # Assuming key in response
             logger.info(f"Scale detected: {scale_info.get('scale', 'unknown')} (confidence: {scale_info.get('confidence', 0)})")
             
-            # Step 3: Batch lines and call Wall Detection API for each batch
+            # Step 3: Batch lines and call Wall Detection API for each batch with lines, scale, texts
             batches = [lines[i:i + BATCH_SIZE] for i in range(0, len(lines), BATCH_SIZE)]
             all_walls = []
             for batch_num, batch in enumerate(batches, 1):
