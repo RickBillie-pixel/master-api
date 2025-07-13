@@ -1,175 +1,149 @@
-import fitz  # PyMuPDF
+"""
+Master API - Orchestrates PDF Processing
+Downloads PDF pages from URLs, extracts vectors, and detects scales
+"""
+
 import requests
-import json
-from typing import Dict, List
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List
 import logging
-import tempfile
+from datetime import datetime
 import os
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("master_api")
 
-def download_pdf_from_url(url: str) -> str:
-    """Download PDF from URL and return temporary file path."""
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(response.content)
-        return tmp_file.name
-    except requests.RequestException as e:
-        logger.error(f"Error downloading PDF: {str(e)}")
-        raise
+app = FastAPI(
+    title="Master PDF Processing API",
+    description="Orchestrates PDF download, vector extraction, and scale detection",
+    version="1.0.0"
+)
 
-def extract_vector_data(pdf_path: str, page_number: int) -> Dict:
-    """Extract vector data (lines, texts) from a specific PDF page."""
-    try:
-        doc = fitz.open(pdf_path)
-        if page_number < 0 or page_number >= len(doc):
-            raise ValueError(f"Invalid page number: {page_number}")
-        
-        page = doc.load_page(page_number)
-        page_width, page_height = page.rect.width, page.rect.height
+class PageInput(BaseModel):
+    url: str
+    page_number: int
 
-        # Extract drawings (vector data)
-        drawings = page.get_drawings()
-        lines = []
-        texts = []
+class ProcessResponse(BaseModel):
+    scales: List[dict]
+    message: str
+    timestamp: str
 
-        for drawing in drawings:
-            for item in drawing["items"]:
-                if item[0] == "l":  # Line
-                    x0, y0, x1, y1 = item[1]
-                    length = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
-                    lines.append({
-                        "type": "line",
-                        "p1": {"x": x0, "y": y0},
-                        "p2": {"x": x1, "y": y1},
-                        "length": length,
-                        "color": item[2][:3] if len(item[2]) >= 3 else [0, 0, 0],
-                        "width": item[2][3] if len(item[2]) > 3 else 0.0
-                    })
+VECTOR_API_URL = "https://vector-api-0wlf.onrender.com/extract-vectors/"
+SCALE_API_URL = "https://scale-api-5f65.onrender.com/detect-scale-from-json/"
 
-        # Extract text
-        text_blocks = page.get_text("dict")["blocks"]
-        for block in text_blocks:
-            if "lines" in block:
-                for line in block["lines"]:
-                    for span in line["spans"]:
-                        texts.append({
-                            "text": span["text"].strip(),
-                            "position": {"x": span["bbox"][0], "y": span["bbox"][1]},
-                            "font_size": span["size"],
-                            "font_name": span["font"],
-                            "color": span["color"],
-                            "bbox": {
-                                "x0": span["bbox"][0],
-                                "y0": span["bbox"][1],
-                                "x1": span["bbox"][2],
-                                "y1": span["bbox"][3],
-                                "width": span["bbox"][2] - span["bbox"][0],
-                                "height": span["bbox"][3] - span["bbox"][1]
-                            }
-                        })
-
-        return {
-            "page_number": page_number + 1,
-            "page_size": {"width": page_width, "height": page_height},
-            "drawings": {"lines": lines, "texts": texts},
-            "is_vector": bool(lines),
-            "processing_time_ms": 0  # Placeholder
-        }
-
-    except Exception as e:
-        logger.error(f"Error extracting vector data: {str(e)}")
-        return {"error": str(e), "page_number": page_number + 1}
-
-def extract_scale_data(pdf_path: str, page_number: int) -> Dict:
-    """Extract scale data from text on a specific PDF page."""
-    try:
-        doc = fitz.open(pdf_path)
-        if page_number < 0 or page_number >= len(doc):
-            raise ValueError(f"Invalid page number: {page_number}")
-        
-        page = doc.load_page(page_number)
-        text = page.get_text("text")
-
-        # Simple scale detection (e.g., "1:50", "1:20")
-        scale_ratios = {"1:50": 0.02, "1:20": 0.05}  # m/pixel approximations
-        detected_scale = None
-        confidence = 0.0
-
-        for ratio, scale in scale_ratios.items():
-            if ratio in text:
-                detected_scale = scale
-                confidence = 0.95
-                break
-
-        if not detected_scale:
-            detected_scale = 0.02  # Default to 1:50
-            confidence = 0.5
-
-        return {
-            "scale": detected_scale,
-            "scale_ratio": [k for k, v in scale_ratios.items() if v == detected_scale][0],
-            "real_meters_per_drawn_cm": detected_scale * 100,
-            "method": "text_extraction" if confidence > 0.7 else "inference",
-            "unit": "m",
-            "message": f"Scale found in {('text_extraction' if confidence > 0.7 else 'inference')}: {scale_ratios}",
-            "confidence": confidence,
-            "validation": {"status": True, "reason": "Text reliable" if confidence > 0.7 else "Inferred"},
-            "page_number": page_number + 1,
-            "version": "2025-07"
-        }
-
-    except Exception as e:
-        logger.error(f"Error extracting scale data: {str(e)}")
-        return {"error": str(e), "page_number": page_number + 1}
-
-def process_drawing(input_data: List[Dict]) -> Dict:
-    """Process input data with URL and page number to extract vector and scale data."""
-    result = {}
-    for item in input_data:
-        url = item.get("url")
-        page_number = item.get("page_number", 0) - 1  # Adjust to 0-based indexing
-
+@app.post("/process-pdf/", response_model=ProcessResponse)
+async def process_pdf(inputs: List[PageInput]):
+    """
+    Process PDF pages:
+    1. Download each page PDF from URL
+    2. Extract vectors for each page
+    3. Combine into single vector data
+    4. Send to scale detection
+    """
+    if not inputs:
+        raise HTTPException(status_code=400, detail="No input pages provided")
+    
+    logger.info(f"Processing {len(inputs)} PDF pages")
+    
+    pages = []
+    total_file_size = 0
+    total_processing_time = 0
+    
+    # Sort inputs by page number
+    sorted_inputs = sorted(inputs, key=lambda x: x.page_number)
+    
+    for inp in sorted_inputs:
+        # Download PDF
         try:
-            # Download PDF
-            pdf_path = download_pdf_from_url(url)
-            vector_data = extract_vector_data(pdf_path, page_number)
-            scale_data = extract_scale_data(pdf_path, page_number)
-
-            # Clean up temporary file
-            os.unlink(pdf_path)
-
-            if "error" in vector_data or "error" in scale_data:
-                result[item] = {
-                    "message": "Drawing processing failed",
-                    "vector_data": vector_data,
-                    "scale_data": scale_data,
-                    "processing_time_ms": 0
-                }
-            else:
-                result[item] = {
-                    "vector_data": vector_data,
-                    "scale_data": [scale_data],
-                    "message": "Drawing processed successfully",
-                    "processing_time_ms": 0  # Replace with actual timing
-                }
-
+            download_resp = requests.get(inp.url, timeout=30)
+            download_resp.raise_for_status()
+            pdf_content = download_resp.content
+            if len(pdf_content) == 0:
+                raise ValueError("Empty PDF content")
+            total_file_size += len(pdf_content)
         except Exception as e:
-            result[item] = {"error": str(e), "message": "Processing failed"}
+            logger.error(f"Failed to download PDF from {inp.url}: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to download PDF page {inp.page_number}: {str(e)}")
+        
+        # Extract vectors
+        try:
+            files = {"file": ("page.pdf", pdf_content, "application/pdf")}
+            vector_resp = requests.post(VECTOR_API_URL, files=files, timeout=60)
+            vector_resp.raise_for_status()
+            vector_data = vector_resp.json()
+            
+            if not vector_data.get("pages"):
+                raise ValueError("No pages in vector response")
+            
+            page_data = vector_data["pages"][0]
+            page_data["page_number"] = inp.page_number
+            pages.append(page_data)
+            
+            total_processing_time += vector_data["summary"].get("processing_time_ms", 0)
+        except Exception as e:
+            logger.error(f"Vector extraction failed for page {inp.page_number}: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Vector extraction failed for page {inp.page_number}: {str(e)}")
+    
+    # Combine into VectorData
+    combined_summary = {
+        "total_pages": len(pages),
+        "total_lines": sum(len(p.get("drawings", {}).get("lines", [])) for p in pages),
+        "total_rectangles": sum(len(p.get("drawings", {}).get("rectangles", [])) for p in pages),
+        "total_curves": sum(len(p.get("drawings", {}).get("curves", [])) for p in pages),
+        "total_texts": sum(len(p.get("texts", [])) for p in pages),
+        "file_size_mb": round(total_file_size / (1024 * 1024), 2),
+        "processing_time_ms": total_processing_time
+    }
+    
+    vector_full = {
+        "pages": pages,
+        "summary": combined_summary
+    }
+    
+    # Detect scale
+    try:
+        scale_resp = requests.post(SCALE_API_URL, json=vector_full, timeout=60)
+        scale_resp.raise_for_status()
+        scale_data = scale_resp.json()
+    except Exception as e:
+        logger.error(f"Scale detection failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Scale detection failed: {str(e)}")
+    
+    return ProcessResponse(
+        scales=scale_data,
+        message="Processing completed successfully",
+        timestamp=datetime.now().isoformat()
+    )
 
-    return result
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "master-api",
+        "version": "1.0.0",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "service": "Master PDF Processing API",
+        "version": "1.0.0",
+        "description": "Downloads PDF pages, extracts vectors, and detects scales",
+        "endpoints": {
+            "process_pdf": "/process-pdf/",
+            "health": "/health"
+        }
+    }
 
 if __name__ == "__main__":
-    # Example input
-    input_data = [
-        {
-            "url": "https://pdf-temp-files.s3.us-west-2.amazonaws.com/QB2NJN6ZKSEI2ZJCOKGFJ7NJ3QTJK6XY/result_page1.pdf?X-Amz-Expires=3600&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIZJDPLX6D7EHVCKA/20250713/us-west-2/s3/aws4_request&X-Amz-Date=20250713T154741Z&X-Amz-SignedHeaders=host&X-Amz-Signature=71d42c389b4d7bd2291b08b4bb7470677661381ed21937f4a9e0aacba47d16ff",
-            "page_number": 1
-        }
-    ]
-    result = process_drawing(input_data)
-    print(json.dumps(result, indent=2))
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
