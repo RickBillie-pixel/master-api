@@ -1,21 +1,34 @@
 import fitz  # PyMuPDF
+import requests
 import json
-from typing import Dict, List, Optional
+from typing import Dict, List
 import logging
+import tempfile
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def download_pdf_from_url(url: str) -> str:
+    """Download PDF from URL and return temporary file path."""
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(response.content)
+        return tmp_file.name
+    except requests.RequestException as e:
+        logger.error(f"Error downloading PDF: {str(e)}")
+        raise
+
 def extract_vector_data(pdf_path: str, page_number: int) -> Dict:
     """Extract vector data (lines, texts) from a specific PDF page."""
     try:
-        # Open PDF
         doc = fitz.open(pdf_path)
         if page_number < 0 or page_number >= len(doc):
             raise ValueError(f"Invalid page number: {page_number}")
         
-        # Get page
         page = doc.load_page(page_number)
         page_width, page_height = page.rect.width, page.rect.height
 
@@ -37,7 +50,6 @@ def extract_vector_data(pdf_path: str, page_number: int) -> Dict:
                         "color": item[2][:3] if len(item[2]) >= 3 else [0, 0, 0],
                         "width": item[2][3] if len(item[2]) > 3 else 0.0
                     })
-                # Note: Other shapes (curves, rects) ignored as per focus on lines
 
         # Extract text
         text_blocks = page.get_text("dict")["blocks"]
@@ -65,8 +77,8 @@ def extract_vector_data(pdf_path: str, page_number: int) -> Dict:
             "page_number": page_number + 1,
             "page_size": {"width": page_width, "height": page_height},
             "drawings": {"lines": lines, "texts": texts},
-            "is_vector": bool(lines),  # True if vector data present
-            "processing_time_ms": 0  # Placeholder, replace with actual timing if needed
+            "is_vector": bool(lines),
+            "processing_time_ms": 0  # Placeholder
         }
 
     except Exception as e:
@@ -91,18 +103,17 @@ def extract_scale_data(pdf_path: str, page_number: int) -> Dict:
         for ratio, scale in scale_ratios.items():
             if ratio in text:
                 detected_scale = scale
-                confidence = 0.95  # High confidence for text match
+                confidence = 0.95
                 break
 
         if not detected_scale:
-            # Fallback: Infer from common scale if no match
             detected_scale = 0.02  # Default to 1:50
-            confidence = 0.5  # Low confidence
+            confidence = 0.5
 
         return {
             "scale": detected_scale,
             "scale_ratio": [k for k, v in scale_ratios.items() if v == detected_scale][0],
-            "real_meters_per_drawn_cm": detected_scale * 100,  # Approx conversion
+            "real_meters_per_drawn_cm": detected_scale * 100,
             "method": "text_extraction" if confidence > 0.7 else "inference",
             "unit": "m",
             "message": f"Scale found in {('text_extraction' if confidence > 0.7 else 'inference')}: {scale_ratios}",
@@ -116,29 +127,49 @@ def extract_scale_data(pdf_path: str, page_number: int) -> Dict:
         logger.error(f"Error extracting scale data: {str(e)}")
         return {"error": str(e), "page_number": page_number + 1}
 
-def process_drawing(pdf_path: str, page_number: int) -> Dict:
-    """Process PDF page to extract vector and scale data."""
-    vector_data = extract_vector_data(pdf_path, page_number)
-    scale_data = extract_scale_data(pdf_path, page_number)
+def process_drawing(input_data: List[Dict]) -> Dict:
+    """Process input data with URL and page number to extract vector and scale data."""
+    result = {}
+    for item in input_data:
+        url = item.get("url")
+        page_number = item.get("page_number", 0) - 1  # Adjust to 0-based indexing
 
-    if "error" in vector_data or "error" in scale_data:
-        return {
-            "message": "Drawing processing failed",
-            "vector_data": vector_data,
-            "scale_data": scale_data,
-            "processing_time_ms": 0
-        }
+        try:
+            # Download PDF
+            pdf_path = download_pdf_from_url(url)
+            vector_data = extract_vector_data(pdf_path, page_number)
+            scale_data = extract_scale_data(pdf_path, page_number)
 
-    return {
-        "vector_data": vector_data,
-        "scale_data": [scale_data],
-        "message": "Drawing processed successfully",
-        "processing_time_ms": 0  # Replace with actual timing
-    }
+            # Clean up temporary file
+            os.unlink(pdf_path)
+
+            if "error" in vector_data or "error" in scale_data:
+                result[item] = {
+                    "message": "Drawing processing failed",
+                    "vector_data": vector_data,
+                    "scale_data": scale_data,
+                    "processing_time_ms": 0
+                }
+            else:
+                result[item] = {
+                    "vector_data": vector_data,
+                    "scale_data": [scale_data],
+                    "message": "Drawing processed successfully",
+                    "processing_time_ms": 0  # Replace with actual timing
+                }
+
+        except Exception as e:
+            result[item] = {"error": str(e), "message": "Processing failed"}
+
+    return result
 
 if __name__ == "__main__":
-    # Example usage
-    pdf_path = "example.pdf"
-    page_number = 0
-    result = process_drawing(pdf_path, page_number)
+    # Example input
+    input_data = [
+        {
+            "url": "https://pdf-temp-files.s3.us-west-2.amazonaws.com/QB2NJN6ZKSEI2ZJCOKGFJ7NJ3QTJK6XY/result_page1.pdf?X-Amz-Expires=3600&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIZJDPLX6D7EHVCKA/20250713/us-west-2/s3/aws4_request&X-Amz-Date=20250713T154741Z&X-Amz-SignedHeaders=host&X-Amz-Signature=71d42c389b4d7bd2291b08b4bb7470677661381ed21937f4a9e0aacba47d16ff",
+            "page_number": 1
+        }
+    ]
+    result = process_drawing(input_data)
     print(json.dumps(result, indent=2))
