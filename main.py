@@ -1,4 +1,6 @@
 import os
+import tempfile
+import uuid
 from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import logging
@@ -31,7 +33,7 @@ SCALE_API_URL = "https://scale-api-69gl.onrender.com/extract-scale/"
 
 @app.post("/process/")
 async def process_pdf(file: UploadFile):
-    """Process PDF: Extract vectors via Vector Drawing API, then calculate scale via Scale API"""
+    """Process PDF: Extract vectors via Vector Drawing API, save to JSON, then calculate scale via Scale API"""
     try:
         logger.info(f"Received file: {file.filename}")
         
@@ -52,9 +54,9 @@ async def process_pdf(file: UploadFile):
                 detail=f"Vector Drawing API error: {vector_response.text}"
             )
         
-        # Parse the minified JSON response and log raw text for debugging
+        # Parse the minified JSON response
         raw_response = vector_response.text
-        logger.info("Raw Vector Drawing API response: %s", raw_response[:500])  # Log first 500 chars
+        logger.info("Raw Vector Drawing API response (first 500 chars): %s", raw_response[:500])
         try:
             vector_data = vector_response.json()
         except ValueError as e:
@@ -63,7 +65,7 @@ async def process_pdf(file: UploadFile):
                 detail=f"Failed to parse Vector Drawing API response as JSON: {e}"
             )
         
-        logger.info("Vector Drawing API response received: %s", vector_data)
+        logger.info("Vector Drawing API response processed successfully")
         
         # Extract relevant data for Scale API (first page assumed)
         if not vector_data.get('pages'):
@@ -73,7 +75,7 @@ async def process_pdf(file: UploadFile):
         drawings = page.get('drawings', {})
         texts = page.get('texts', [])
         
-        # Ensure vectors have length if missing
+        # Prepare data for Scale API
         vector_data_for_scale = {
             "vector_data": [
                 {
@@ -88,9 +90,24 @@ async def process_pdf(file: UploadFile):
             ]
         }
         
-        # Step 2: Call Scale API
-        logger.info("Calling Scale API with data: %s", vector_data_for_scale)
-        scale_response = requests.post(SCALE_API_URL, json=vector_data_for_scale, timeout=300)
+        # Step 2: Save to temporary JSON file
+        temp_file_name = f"scale_input_{uuid.uuid4()}.json"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as temp_file:
+            import json
+            json.dump(vector_data_for_scale, temp_file)
+            temp_file_path = temp_file.name
+        
+        logger.info(f"Temporary JSON file created at: {temp_file_path}")
+        
+        # Step 3: Call Scale API with the JSON file
+        with open(temp_file_path, 'rb') as scale_input_file:
+            files = {'file': (temp_file_name, scale_input_file, 'application/json')}
+            logger.info("Calling Scale API with JSON file")
+            scale_response = requests.post(SCALE_API_URL, files=files, timeout=300)
+        
+        # Clean up temporary file
+        import os
+        os.unlink(temp_file_path)
         
         if scale_response.status_code != 200:
             raise HTTPException(
@@ -99,13 +116,13 @@ async def process_pdf(file: UploadFile):
             )
         
         scale_data = scale_response.json()
-        logger.info("Scale API response received: %s", scale_data)
+        logger.info("Scale API response received successfully")
         
         # Combine and return results
         result = {
             "vector_data": vector_data,
             "scale_data": scale_data,
-            "timestamp": "2025-07-18 17:50 CEST"
+            "timestamp": "2025-07-18 17:54 CEST"
         }
         
         return result
@@ -119,7 +136,7 @@ async def process_pdf(file: UploadFile):
 
 @app.get("/health/")
 async def health():
-    return {"status": "healthy", "version": "1.0", "timestamp": "2025-07-18 17:50 CEST"}
+    return {"status": "healthy", "version": "1.0", "timestamp": "2025-07-18 17:54 CEST"}
 
 if __name__ == "__main__":
     import uvicorn
