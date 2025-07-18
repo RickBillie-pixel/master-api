@@ -3,7 +3,7 @@ from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import requests
-from typing import Dict
+from typing import Dict, Any
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -31,11 +31,11 @@ SCALE_API_URL = "https://scale-api-69gl.onrender.com/extract-scale/"
 
 @app.post("/process/")
 async def process_pdf(file: UploadFile):
-    """Process PDF: Extract vectors then calculate scale"""
+    """Process PDF: Extract vectors via Vector Drawing API, then calculate scale via Scale API"""
     try:
         logger.info(f"Received file: {file.filename}")
         
-        # Step 1: Call Vector Drawing API
+        # Step 1: Call Vector Drawing API with specified parameters
         files = {'file': (file.filename, await file.read(), 'application/pdf')}
         params = {
             'minify': 'true',
@@ -43,34 +43,44 @@ async def process_pdf(file: UploadFile):
             'precision': '2'
         }
         
-        logger.info("Calling Vector API")
-        vector_response = requests.post(VECTOR_API_URL, files=files, params=params)
+        logger.info("Calling Vector Drawing API")
+        vector_response = requests.post(VECTOR_API_URL, files=files, params=params, timeout=300)
         
         if vector_response.status_code != 200:
             raise HTTPException(
                 status_code=vector_response.status_code,
-                detail=f"Vector API error: {vector_response.text}"
+                detail=f"Vector Drawing API error: {vector_response.text}"
             )
         
         vector_data = vector_response.json()
-        logger.info("Vector API response received")
+        logger.info("Vector Drawing API response received")
         
-        # Extract relevant data from vector output
-        # Assuming vector_data has 'pages' with 'drawings' and 'texts'
-        # We take first page for simplicity; adjust if multi-page
+        # Extract relevant data for Scale API (first page assumed)
         if not vector_data.get('pages'):
             raise HTTPException(status_code=400, detail="No pages in vector data")
         
         page = vector_data['pages'][0]
         drawings = page.get('drawings', {})
-        input_for_scale = {
-            "vector_data": drawings.get('lines', []) + drawings.get('curves', []),
-            "texts": page.get('texts', [])
+        texts = page.get('texts', [])
+        
+        # Ensure vectors have length if missing
+        vector_data_for_scale = {
+            "vector_data": [
+                {
+                    "type": v["type"],
+                    "p1": v["p1"],
+                    "p2": v["p2"],
+                    "length": v.get("length", None)  # Will be inferred by Scale API if None
+                } for v in drawings.get('lines', []) + drawings.get('curves', [])
+            ],
+            "texts": [
+                {"text": t["text"], "position": t["position"]} for t in texts
+            ]
         }
         
         # Step 2: Call Scale API
         logger.info("Calling Scale API")
-        scale_response = requests.post(SCALE_API_URL, json=input_for_scale)
+        scale_response = requests.post(SCALE_API_URL, json=vector_data_for_scale, timeout=300)
         
         if scale_response.status_code != 200:
             raise HTTPException(
@@ -81,21 +91,25 @@ async def process_pdf(file: UploadFile):
         scale_data = scale_response.json()
         logger.info("Scale API response received")
         
-        # Combine results
+        # Combine and return results
         result = {
             "vector_data": vector_data,
-            "scale_data": scale_data
+            "scale_data": scale_data,
+            "timestamp": "2025-07-18 17:34 CEST"
         }
         
         return result
         
+    except HTTPException as e:
+        logger.error(f"HTTP Exception: {e.detail}", exc_info=True)
+        raise
     except Exception as e:
         logger.error(f"Error during processing: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health/")
 async def health():
-    return {"status": "healthy", "version": "1.0"}
+    return {"status": "healthy", "version": "1.0", "timestamp": "2025-07-18 17:34 CEST"}
 
 if __name__ == "__main__":
     import uvicorn
