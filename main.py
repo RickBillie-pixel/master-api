@@ -57,29 +57,27 @@ async def process_pdf(file: UploadFile):
         
         # Parse the minified JSON response with explicit decoding and error handling
         raw_response = vector_response.text
-        logger.info("Raw Vector Drawing API response (first 1000 chars): %s", raw_response[:1000])
+        logger.info(f"Raw Vector Drawing API response (first 1000 chars): {raw_response[:1000]}")
+        
         try:
-            # Explicitly parse the JSON string into a dictionary
+            # IMPORTANT: Explicitly parse the JSON string into a dictionary
             vector_data = json.loads(raw_response)
             
-            if not isinstance(vector_data, dict):
-                raise ValueError("Parsed response is not a dictionary")
+            # Don't do this type check as the response is valid JSON, just process it
+            # if not isinstance(vector_data, dict):
+            #    raise ValueError("Parsed response is not a dictionary")
+            
         except json.JSONDecodeError as e:
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to parse Vector Drawing API response as JSON: {e}. Raw response: {raw_response[:500]}"
             )
-        except ValueError as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Invalid data structure: {e}. Raw response: {raw_response[:500]}"
-            )
         
         logger.info("Vector Drawing API response processed successfully")
         
         # Extract relevant data for Scale API (first page assumed)
-        if not vector_data.get('pages'):
-            raise HTTPException(status_code=400, detail="No pages in vector data")
+        if not isinstance(vector_data, dict) or 'pages' not in vector_data or not vector_data['pages']:
+            raise HTTPException(status_code=400, detail="Invalid or missing pages in vector data")
         
         page = vector_data['pages'][0]
         drawings = page.get('drawings', {})
@@ -94,11 +92,17 @@ async def process_pdf(file: UploadFile):
                     "p2": v["p2"],
                     "length": v.get("length", None)  # Will be inferred by Scale API if None
                 } for v in drawings.get('lines', []) + drawings.get('curves', [])
+                if "type" in v and "p1" in v and "p2" in v  # Ensure required fields exist
             ],
             "texts": [
-                {"text": t["text"], "position": t["position"]} for t in texts
+                {"text": t["text"], "position": t["position"]} 
+                for t in texts
+                if "text" in t and "position" in t  # Ensure required fields exist
             ]
         }
+        
+        # Log what we're sending to Scale API
+        logger.info(f"Preparing Scale API input with {len(vector_data_for_scale['vector_data'])} vectors and {len(vector_data_for_scale['texts'])} texts")
         
         # Step 2: Save to temporary JSON file
         temp_file_name = f"scale_input_{uuid.uuid4()}.json"
@@ -109,32 +113,41 @@ async def process_pdf(file: UploadFile):
         logger.info(f"Temporary JSON file created at: {temp_file_path}")
         
         # Step 3: Call Scale API with the JSON file
-        with open(temp_file_path, 'rb') as scale_input_file:
-            files = {'file': (temp_file_name, scale_input_file, 'application/json')}
-            logger.info("Calling Scale API with JSON file")
-            scale_response = requests.post(SCALE_API_URL, files=files, timeout=300)
-        
-        # Clean up temporary file
-        import os
-        os.unlink(temp_file_path)
-        
-        if scale_response.status_code != 200:
-            raise HTTPException(
-                status_code=scale_response.status_code,
-                detail=f"Scale API error: {scale_response.text}"
-            )
-        
-        # Parse the Scale API response
         try:
-            scale_data = scale_response.json()
-        except json.JSONDecodeError as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to parse Scale API response as JSON: {e}"
-            )
+            with open(temp_file_path, 'rb') as scale_input_file:
+                files = {'file': (temp_file_name, scale_input_file, 'application/json')}
+                logger.info("Calling Scale API with JSON file")
+                scale_response = requests.post(SCALE_API_URL, files=files, timeout=300)
             
-        logger.info("Scale API response received successfully")
-        
+            # Clean up temporary file
+            os.unlink(temp_file_path)
+            
+            if scale_response.status_code != 200:
+                raise HTTPException(
+                    status_code=scale_response.status_code,
+                    detail=f"Scale API error: {scale_response.text}"
+                )
+            
+            # Parse the Scale API response
+            try:
+                scale_data = scale_response.json()
+                logger.info("Scale API response received successfully")
+            except json.JSONDecodeError as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to parse Scale API response as JSON: {e}"
+                )
+        except Exception as e:
+            logger.error(f"Error calling Scale API: {e}", exc_info=True)
+            
+            # If Scale API fails, we can still return the vector data
+            return {
+                "vector_data": vector_data,
+                "scale_data": None,
+                "timestamp": "2025-07-18 18:03 CEST",
+                "error": f"Scale API error: {str(e)}"
+            }
+            
         # Combine and return results
         result = {
             "vector_data": vector_data,
