@@ -5,6 +5,7 @@ from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import requests
+import json
 from typing import Dict, Any
 
 # Configure logging
@@ -58,13 +59,20 @@ async def process_pdf(file: UploadFile):
         raw_response = vector_response.text
         logger.info("Raw Vector Drawing API response (first 1000 chars): %s", raw_response[:1000])
         try:
-            vector_data = vector_response.json()  # Should parse to dict
+            # Explicitly parse the JSON string into a dictionary
+            vector_data = json.loads(raw_response)
+            
             if not isinstance(vector_data, dict):
                 raise ValueError("Parsed response is not a dictionary")
-        except ValueError as e:
+        except json.JSONDecodeError as e:
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to parse Vector Drawing API response as JSON: {e}. Raw response: {raw_response[:500]}"
+            )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid data structure: {e}. Raw response: {raw_response[:500]}"
             )
         
         logger.info("Vector Drawing API response processed successfully")
@@ -95,7 +103,6 @@ async def process_pdf(file: UploadFile):
         # Step 2: Save to temporary JSON file
         temp_file_name = f"scale_input_{uuid.uuid4()}.json"
         with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as temp_file:
-            import json
             json.dump(vector_data_for_scale, temp_file)
             temp_file_path = temp_file.name
         
@@ -117,7 +124,15 @@ async def process_pdf(file: UploadFile):
                 detail=f"Scale API error: {scale_response.text}"
             )
         
-        scale_data = scale_response.json()
+        # Parse the Scale API response
+        try:
+            scale_data = scale_response.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to parse Scale API response as JSON: {e}"
+            )
+            
         logger.info("Scale API response received successfully")
         
         # Combine and return results
