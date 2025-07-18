@@ -52,8 +52,17 @@ async def process_pdf(file: UploadFile):
                 detail=f"Vector Drawing API error: {vector_response.text}"
             )
         
-        # Parse the minified JSON response
-        vector_data = vector_response.json()  # This ensures it's a dictionary
+        # Parse the minified JSON response and log raw text for debugging
+        raw_response = vector_response.text
+        logger.info("Raw Vector Drawing API response: %s", raw_response[:500])  # Log first 500 chars
+        try:
+            vector_data = vector_response.json()
+        except ValueError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to parse Vector Drawing API response as JSON: {e}"
+            )
+        
         logger.info("Vector Drawing API response received: %s", vector_data)
         
         # Extract relevant data for Scale API (first page assumed)
@@ -96,7 +105,7 @@ async def process_pdf(file: UploadFile):
         result = {
             "vector_data": vector_data,
             "scale_data": scale_data,
-            "timestamp": "2025-07-18 17:46 CEST"
+            "timestamp": "2025-07-18 17:50 CEST"
         }
         
         return result
@@ -110,7 +119,7 @@ async def process_pdf(file: UploadFile):
 
 @app.get("/health/")
 async def health():
-    return {"status": "healthy", "version": "1.0", "timestamp": "2025-07-18 17:46 CEST"}
+    return {"status": "healthy", "version": "1.0", "timestamp": "2025-07-18 17:50 CEST"}
 
 if __name__ == "__main__":
     import uvicorn
