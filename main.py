@@ -54,15 +54,17 @@ async def process_pdf(file: UploadFile):
                 detail=f"Vector Drawing API error: {vector_response.text}"
             )
         
-        # Parse the minified JSON response
+        # Parse the minified JSON response with explicit decoding and error handling
         raw_response = vector_response.text
-        logger.info("Raw Vector Drawing API response (first 500 chars): %s", raw_response[:500])
+        logger.info("Raw Vector Drawing API response (first 1000 chars): %s", raw_response[:1000])
         try:
-            vector_data = vector_response.json()
+            vector_data = vector_response.json()  # Should parse to dict
+            if not isinstance(vector_data, dict):
+                raise ValueError("Parsed response is not a dictionary")
         except ValueError as e:
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to parse Vector Drawing API response as JSON: {e}"
+                detail=f"Failed to parse Vector Drawing API response as JSON: {e}. Raw response: {raw_response[:500]}"
             )
         
         logger.info("Vector Drawing API response processed successfully")
@@ -122,7 +124,7 @@ async def process_pdf(file: UploadFile):
         result = {
             "vector_data": vector_data,
             "scale_data": scale_data,
-            "timestamp": "2025-07-18 17:54 CEST"
+            "timestamp": "2025-07-18 18:03 CEST"
         }
         
         return result
@@ -136,7 +138,7 @@ async def process_pdf(file: UploadFile):
 
 @app.get("/health/")
 async def health():
-    return {"status": "healthy", "version": "1.0", "timestamp": "2025-07-18 17:54 CEST"}
+    return {"status": "healthy", "version": "1.0", "timestamp": "2025-07-18 18:03 CEST"}
 
 if __name__ == "__main__":
     import uvicorn
