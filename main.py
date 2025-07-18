@@ -32,43 +32,6 @@ app.add_middleware(
 VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
 SCALE_API_URL = "https://scale-api-69gl.onrender.com/extract-scale/"
 
-def parse_json_safely(json_str: str) -> Optional[Dict]:
-    """Parse JSON string safely with additional error handling and debugging"""
-    try:
-        # Try standard JSON parsing first
-        result = json.loads(json_str)
-        
-        # Check if result is a dictionary
-        if not isinstance(result, dict):
-            logger.error(f"Parsed result is not a dictionary, type={type(result)}")
-            return None
-            
-        return result
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error: {e}")
-        
-        # Try to extract valid JSON if partial
-        try:
-            # Look for the ending curly brace
-            if json_str.count('{') > json_str.count('}'):
-                # The JSON might be truncated, try to add missing closing braces
-                missing_braces = json_str.count('{') - json_str.count('}')
-                fixed_json = json_str + ('}' * missing_braces)
-                logger.info(f"Attempting to fix truncated JSON by adding {missing_braces} closing braces")
-                return json.loads(fixed_json)
-        except Exception:
-            pass
-        
-        # Try with a different JSON parser if available
-        try:
-            import simplejson
-            logger.info("Trying with simplejson")
-            return simplejson.loads(json_str)
-        except (ImportError, Exception):
-            pass
-            
-        return None
-
 @app.post("/process/")
 async def process_pdf(file: UploadFile):
     """Process PDF: Extract vectors via Vector Drawing API, save to JSON, then calculate scale via Scale API"""
@@ -93,103 +56,42 @@ async def process_pdf(file: UploadFile):
                 detail=f"Vector Drawing API error: {vector_response.text}"
             )
         
-        # Parse the JSON response with enhanced error handling
+        # Parse the JSON response
         raw_response = vector_response.text
         logger.info(f"Raw Vector Drawing API response (first 1000 chars): {raw_response[:1000]}")
         logger.info(f"Response length: {len(raw_response)} bytes")
         
-        # Try to get response as JSON directly from requests
+        # CRITICAL FIX: Explicitly use json.loads to parse the string
         try:
-            vector_data = vector_response.json()
-            logger.info("Successfully parsed response using requests.json()")
+            vector_data = json.loads(raw_response)
+            if isinstance(vector_data, str):
+                # If it's still a string, try parsing it again
+                logger.warning("First parse resulted in a string, trying again")
+                vector_data = json.loads(vector_data)
+                
+            logger.info(f"Successfully parsed response, type={type(vector_data)}")
         except Exception as e:
-            logger.warning(f"Could not parse with requests.json(): {e}")
+            logger.error(f"JSON parsing error: {e}")
             
-            # Use our custom safe parser
-            vector_data = parse_json_safely(raw_response)
+            # Try to extract information from a malformed JSON as a last resort
+            # Write raw response to a temporary file for debugging
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w") as debug_file:
+                debug_file.write(raw_response)
+                debug_path = debug_file.name
+            logger.info(f"Wrote raw response to {debug_path}")
             
-            if not vector_data:
-                # Last resort: try to extract just what we need
-                logger.info("Attempting manual extraction of required data")
-                try:
-                    # Write raw response to temporary file for debugging
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w") as debug_file:
-                        debug_file.write(raw_response)
-                        debug_path = debug_file.name
-                    logger.info(f"Wrote raw response to {debug_path}")
-                    
-                    # Manual extraction of pages data
-                    import re
-                    pages_match = re.search(r'"pages":\s*\[\s*{(.+?)}\s*\]', raw_response, re.DOTALL)
-                    if pages_match:
-                        page_content = pages_match.group(1)
-                        logger.info(f"Extracted page content (first 100 chars): {page_content[:100]}")
-                        
-                        # Extract texts
-                        texts_match = re.search(r'"texts":\s*\[(.+?)\]', page_content, re.DOTALL)
-                        if texts_match:
-                            texts_content = texts_match.group(1)
-                            
-                            # Try to parse individual text items
-                            text_items = []
-                            for text_match in re.finditer(r'{(.+?)}', texts_content, re.DOTALL):
-                                try:
-                                    text_item = json.loads('{' + text_match.group(1) + '}')
-                                    text_items.append(text_item)
-                                except:
-                                    pass
-                            
-                            # Extract drawings
-                            drawings_match = re.search(r'"drawings":\s*{(.+?)}', page_content, re.DOTALL)
-                            if drawings_match:
-                                drawings_content = drawings_match.group(1)
-                                
-                                # Manual construction of vector_data
-                                vector_data = {
-                                    "pages": [
-                                        {
-                                            "texts": text_items,
-                                            "drawings": {}
-                                        }
-                                    ]
-                                }
-                                
-                                # Try to extract lines
-                                lines_match = re.search(r'"lines":\s*\[(.+?)\]', drawings_content, re.DOTALL)
-                                if lines_match:
-                                    lines_content = lines_match.group(1)
-                                    
-                                    # Try to parse individual line items
-                                    line_items = []
-                                    for line_match in re.finditer(r'{(.+?)}', lines_content, re.DOTALL):
-                                        try:
-                                            line_item = json.loads('{' + line_match.group(1) + '}')
-                                            line_items.append(line_item)
-                                        except:
-                                            pass
-                                    
-                                    vector_data["pages"][0]["drawings"]["lines"] = line_items
-                except Exception as e:
-                    logger.error(f"Manual extraction failed: {e}")
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Could not parse Vector Drawing API response: {str(e)}"
-                    )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to parse Vector Drawing API response: {str(e)}"
+            )
         
         logger.info("Vector Drawing API response processed successfully")
         
-        # Extra validation to ensure we have the expected structure
-        if vector_data is None:
-            raise HTTPException(
-                status_code=500, 
-                detail="Failed to parse Vector Drawing API response"
-            )
-            
         # Debug output of the parsed data structure
         logger.info(f"Parsed data type: {type(vector_data)}")
         logger.info(f"Parsed data keys: {vector_data.keys() if isinstance(vector_data, dict) else 'Not a dict'}")
         
-        # Check if pages exists in vector_data
+        # Verify we have the expected structure
         if not isinstance(vector_data, dict) or 'pages' not in vector_data or not vector_data['pages']:
             raise HTTPException(
                 status_code=400, 
