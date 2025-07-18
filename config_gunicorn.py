@@ -25,7 +25,7 @@ errorlog = "-"
 loglevel = "info"
 
 # Process naming
-proc_name = 'merged-extraction-api'
+proc_name = 'master-api'
 
 # Server mechanics
 daemon = False
