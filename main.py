@@ -100,14 +100,8 @@ async def process_pdf(file: UploadFile):
             
             if filter_response.status_code != 200:
                 logger.error(f"Pre-Filter API error: {filter_response.status_code} - {filter_response.text}")
-                # Return original data if filtering fails
-                return {
-                    "status": "partial_success",
-                    "message": "Vector extraction successful, but filtering failed",
-                    "vector_data": vector_data,
-                    "filtered_data": None,
-                    "filter_error": filter_response.text
-                }
+                # Return ONLY the filtered data
+                return filtered_data
             
             # Parse Pre-Filter API response
             try:
@@ -121,26 +115,11 @@ async def process_pdf(file: UploadFile):
                 
             except Exception as e:
                 logger.error(f"Error parsing Pre-Filter API response: {e}")
-                return {
-                    "status": "partial_success",
-                    "message": "Vector extraction successful, but filter response parsing failed",
-                    "vector_data": vector_data,
-                    "filtered_data": None,
-                    "filter_error": str(e)
-                }
+                # Return ONLY the filtered data (even on parse error)
+                return vector_data  # Return original if filter parsing fails
             
-            # Return both original and filtered results
-            return {
-                "status": "success",
-                "message": "PDF processed successfully",
-                "original_data": vector_data,
-                "filtered_data": filtered_data,
-                "statistics": {
-                    "original_lines": vector_data.get('summary', {}).get('total_lines', 0),
-                    "filtered_lines": filtered_data.get('summary', {}).get('total_lines', 0),
-                    "total_texts": filtered_data.get('summary', {}).get('total_texts', 0)
-                }
-            }
+            # Return ONLY the filtered data
+            return filtered_data
             
         finally:
             # Clean up temp file
