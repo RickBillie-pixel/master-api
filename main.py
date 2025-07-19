@@ -17,7 +17,7 @@ PORT = int(os.environ.get("PORT", 10000))
 app = FastAPI(
     title="Master API",
     description="Processes PDF by calling Vector Drawing API and Pre-Filter API",
-    version="1.0.0"
+    version="1.0.1"
 )
 
 # CORS middleware
@@ -34,7 +34,7 @@ PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/pre-filter/"
 
 @app.post("/process/")
 async def process_pdf(file: UploadFile):
-    """Process PDF: Extract vectors via Vector Drawing API, save to JSON, then filter via Pre-Filter API"""
+    """Process PDF: Extract vectors via Vector Drawing API, then filter via Pre-Filter API"""
     try:
         logger.info(f"Received file: {file.filename}")
         
@@ -42,7 +42,7 @@ async def process_pdf(file: UploadFile):
         file_content = await file.read()
         files = {'file': (file.filename, file_content, 'application/pdf')}
         params = {
-            'minify': 'false',  # Use non-minified output
+            'minify': 'false',  # Use non-minified output for easier processing
             'remove_non_essential': 'false',
             'precision': '2'
         }
@@ -58,135 +58,119 @@ async def process_pdf(file: UploadFile):
         
         # Get the raw response text
         raw_response = vector_response.text
-        logger.info(f"Raw Vector Drawing API response (first 100 chars): {raw_response[:100]}")
-        logger.info(f"Response length: {len(raw_response)} bytes")
+        logger.info(f"Vector Drawing API response length: {len(raw_response)} bytes")
         
-        # Don't use requests.json() - explicitly parse the JSON string
+        # Parse the JSON response
         try:
-            # Use standard json module to parse
             vector_data = json.loads(raw_response)
-            logger.info(f"JSON parsed successfully, type={type(vector_data)}")
-            logger.info(f"Top-level keys: {list(vector_data.keys()) if isinstance(vector_data, dict) else 'Not a dict'}")
             
-            # Double-check if we need to parse again (in case of double-encoding)
+            # Handle double-encoded JSON if necessary
             if isinstance(vector_data, str):
-                logger.warning("Parsed result is still a string, attempting to parse again")
+                logger.warning("Response is double-encoded, parsing again")
                 vector_data = json.loads(vector_data)
-                logger.info(f"Second parse: type={type(vector_data)}")
-                logger.info(f"Second parse keys: {list(vector_data.keys()) if isinstance(vector_data, dict) else 'Not a dict'}")
+            
+            logger.info(f"Parsed Vector Drawing API response successfully")
+            
         except Exception as e:
             logger.error(f"JSON parsing error: {e}")
-            # Save problematic response for debugging
-            debug_path = f"/tmp/vector_response_{uuid.uuid4()}.json"
-            with open(debug_path, 'w') as f:
-                f.write(raw_response)
-            logger.info(f"Saved problematic response to {debug_path}")
             raise HTTPException(status_code=500, detail=f"Failed to parse Vector Drawing API response: {str(e)}")
         
-        # Ensure we have the expected structure
+        # Validate structure
         if not isinstance(vector_data, dict):
-            raise HTTPException(status_code=400, detail="Parsed result is not a dictionary")
+            raise HTTPException(status_code=400, detail="Vector Drawing API response is not a dictionary")
             
-        if 'pages' not in vector_data or not vector_data['pages']:
-            raise HTTPException(status_code=400, detail="No pages found in vector data")
-            
-        # Get the first page
-        page = vector_data['pages'][0]
+        if 'pages' not in vector_data or 'metadata' not in vector_data:
+            raise HTTPException(status_code=400, detail="Vector Drawing API response missing required fields")
         
-        # Extract drawings and texts
-        drawings = page.get('drawings', {})
-        texts = page.get('texts', [])
-        
-        logger.info(f"Found {len(texts)} texts and drawing types: {list(drawings.keys())}")
-        
-        # Prepare data for Pre-Filter API
-        vector_data_for_filter = {
-            "vector_data": [],
-            "texts": []
-        }
-        
-        # Process lines from drawings
-        if 'lines' in drawings and isinstance(drawings['lines'], list):
-            for line in drawings['lines']:
-                if 'p1' in line and 'p2' in line:
-                    vector_data_for_filter["vector_data"].append({
-                        "type": line.get("type", "line"),
-                        "p1": line["p1"],
-                        "p2": line["p2"],
-                        "length": line.get("length")
-                    })
-        
-        # Process texts
-        for text in texts:
-            if 'text' in text and 'position' in text:
-                vector_data_for_filter["texts"].append({
-                    "text": text["text"],
-                    "position": text["position"]
-                })
-        
-        logger.info(f"Prepared {len(vector_data_for_filter['vector_data'])} vectors and {len(vector_data_for_filter['texts'])} texts for Pre-Filter API")
-        
-        # Save to temporary file
-        temp_file_path = f"/tmp/filter_input_{uuid.uuid4()}.json"
-        with open(temp_file_path, 'w') as f:
-            json.dump(vector_data_for_filter, f)
-        
-        logger.info(f"Saved input for Pre-Filter API to {temp_file_path}")
-        
-        # Call Pre-Filter API
+        # Step 2: Send the complete Vector Drawing API output to Pre-Filter API
+        # The Pre-Filter API expects the full Vector Drawing API output format
+        temp_file_path = f"/tmp/vector_output_{uuid.uuid4()}.json"
         try:
+            # Save Vector Drawing API output to temporary file
+            with open(temp_file_path, 'w') as f:
+                json.dump(vector_data, f)
+            
+            logger.info(f"Saved Vector Drawing API output to {temp_file_path}")
+            
+            # Send to Pre-Filter API
             with open(temp_file_path, 'rb') as f:
-                filter_files = {'file': (os.path.basename(temp_file_path), f, 'application/json')}
+                filter_files = {'file': (f'vector_output_{file.filename}.json', f, 'application/json')}
                 logger.info("Calling Pre-Filter API")
                 filter_response = requests.post(PRE_FILTER_API_URL, files=filter_files, timeout=300)
             
-            # Clean up temp file
-            os.unlink(temp_file_path)
-            
             if filter_response.status_code != 200:
-                logger.warning(f"Pre-Filter API error: {filter_response.status_code}")
+                logger.error(f"Pre-Filter API error: {filter_response.status_code} - {filter_response.text}")
+                # Return original data if filtering fails
                 return {
+                    "status": "partial_success",
+                    "message": "Vector extraction successful, but filtering failed",
                     "vector_data": vector_data,
                     "filtered_data": None,
-                    "error": filter_response.text
+                    "filter_error": filter_response.text
                 }
             
             # Parse Pre-Filter API response
             try:
                 filtered_data = filter_response.json()
                 logger.info("Pre-Filter API response parsed successfully")
+                
+                # Log filtering statistics
+                if 'summary' in filtered_data:
+                    summary = filtered_data['summary']
+                    logger.info(f"Filtering stats: {summary.get('total_lines', 0)} lines kept out of {summary.get('original_lines', 0)}")
+                
             except Exception as e:
                 logger.error(f"Error parsing Pre-Filter API response: {e}")
                 return {
+                    "status": "partial_success",
+                    "message": "Vector extraction successful, but filter response parsing failed",
                     "vector_data": vector_data,
                     "filtered_data": None,
-                    "error": f"Error parsing Pre-Filter API response: {str(e)}"
+                    "filter_error": str(e)
                 }
             
-            # Return combined results
+            # Return both original and filtered results
             return {
-                "vector_data": vector_data,
+                "status": "success",
+                "message": "PDF processed successfully",
+                "original_data": vector_data,
                 "filtered_data": filtered_data,
-                "timestamp": "2025-07-18"
+                "statistics": {
+                    "original_lines": vector_data.get('summary', {}).get('total_lines', 0),
+                    "filtered_lines": filtered_data.get('summary', {}).get('total_lines', 0),
+                    "total_texts": filtered_data.get('summary', {}).get('total_texts', 0)
+                }
             }
             
-        except Exception as e:
-            logger.error(f"Error calling Pre-Filter API: {e}")
-            return {
-                "vector_data": vector_data,
-                "filtered_data": None,
-                "error": f"Error calling Pre-Filter API: {str(e)}"
-            }
+        finally:
+            # Clean up temp file
+            if os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                except Exception as e:
+                    logger.warning(f"Failed to delete temp file: {e}")
     
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.error(f"Unexpected error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health/")
 async def health():
-    return {"status": "healthy", "version": "1.0"}
+    return {"status": "healthy", "version": "1.0.1"}
+
+@app.get("/")
+async def root():
+    return {
+        "title": "Master API",
+        "description": "Processes PDFs through Vector Drawing API and Pre-Filter API",
+        "endpoints": {
+            "/": "This page",
+            "/process/": "POST - Process PDF file",
+            "/health/": "GET - Health check"
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn
