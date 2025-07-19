@@ -16,7 +16,7 @@ PORT = int(os.environ.get("PORT", 10000))
 
 app = FastAPI(
     title="Master API",
-    description="Processes PDF by calling Vector Drawing API and Scale API",
+    description="Processes PDF by calling Vector Drawing API and Pre-Filter API",
     version="1.0.0"
 )
 
@@ -30,11 +30,11 @@ app.add_middleware(
 )
 
 VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
-SCALE_API_URL = "https://scale-api-69gl.onrender.com/extract-scale/"
+PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/pre-filter/"
 
 @app.post("/process/")
 async def process_pdf(file: UploadFile):
-    """Process PDF: Extract vectors via Vector Drawing API, save to JSON, then calculate scale via Scale API"""
+    """Process PDF: Extract vectors via Vector Drawing API, save to JSON, then filter via Pre-Filter API"""
     try:
         logger.info(f"Received file: {file.filename}")
         
@@ -99,8 +99,8 @@ async def process_pdf(file: UploadFile):
         
         logger.info(f"Found {len(texts)} texts and drawing types: {list(drawings.keys())}")
         
-        # Prepare data for Scale API
-        vector_data_for_scale = {
+        # Prepare data for Pre-Filter API
+        vector_data_for_filter = {
             "vector_data": [],
             "texts": []
         }
@@ -109,7 +109,7 @@ async def process_pdf(file: UploadFile):
         if 'lines' in drawings and isinstance(drawings['lines'], list):
             for line in drawings['lines']:
                 if 'p1' in line and 'p2' in line:
-                    vector_data_for_scale["vector_data"].append({
+                    vector_data_for_filter["vector_data"].append({
                         "type": line.get("type", "line"),
                         "p1": line["p1"],
                         "p2": line["p2"],
@@ -119,63 +119,63 @@ async def process_pdf(file: UploadFile):
         # Process texts
         for text in texts:
             if 'text' in text and 'position' in text:
-                vector_data_for_scale["texts"].append({
+                vector_data_for_filter["texts"].append({
                     "text": text["text"],
                     "position": text["position"]
                 })
         
-        logger.info(f"Prepared {len(vector_data_for_scale['vector_data'])} vectors and {len(vector_data_for_scale['texts'])} texts for Scale API")
+        logger.info(f"Prepared {len(vector_data_for_filter['vector_data'])} vectors and {len(vector_data_for_filter['texts'])} texts for Pre-Filter API")
         
         # Save to temporary file
-        temp_file_path = f"/tmp/scale_input_{uuid.uuid4()}.json"
+        temp_file_path = f"/tmp/filter_input_{uuid.uuid4()}.json"
         with open(temp_file_path, 'w') as f:
-            json.dump(vector_data_for_scale, f)
+            json.dump(vector_data_for_filter, f)
         
-        logger.info(f"Saved input for Scale API to {temp_file_path}")
+        logger.info(f"Saved input for Pre-Filter API to {temp_file_path}")
         
-        # Call Scale API
+        # Call Pre-Filter API
         try:
             with open(temp_file_path, 'rb') as f:
-                scale_files = {'file': (os.path.basename(temp_file_path), f, 'application/json')}
-                logger.info("Calling Scale API")
-                scale_response = requests.post(SCALE_API_URL, files=scale_files, timeout=300)
+                filter_files = {'file': (os.path.basename(temp_file_path), f, 'application/json')}
+                logger.info("Calling Pre-Filter API")
+                filter_response = requests.post(PRE_FILTER_API_URL, files=filter_files, timeout=300)
             
             # Clean up temp file
             os.unlink(temp_file_path)
             
-            if scale_response.status_code != 200:
-                logger.warning(f"Scale API error: {scale_response.status_code}")
+            if filter_response.status_code != 200:
+                logger.warning(f"Pre-Filter API error: {filter_response.status_code}")
                 return {
                     "vector_data": vector_data,
-                    "scale_data": None,
-                    "error": scale_response.text
+                    "filtered_data": None,
+                    "error": filter_response.text
                 }
             
-            # Parse Scale API response
+            # Parse Pre-Filter API response
             try:
-                scale_data = scale_response.json()
-                logger.info("Scale API response parsed successfully")
+                filtered_data = filter_response.json()
+                logger.info("Pre-Filter API response parsed successfully")
             except Exception as e:
-                logger.error(f"Error parsing Scale API response: {e}")
+                logger.error(f"Error parsing Pre-Filter API response: {e}")
                 return {
                     "vector_data": vector_data,
-                    "scale_data": None,
-                    "error": f"Error parsing Scale API response: {str(e)}"
+                    "filtered_data": None,
+                    "error": f"Error parsing Pre-Filter API response: {str(e)}"
                 }
             
             # Return combined results
             return {
                 "vector_data": vector_data,
-                "scale_data": scale_data,
+                "filtered_data": filtered_data,
                 "timestamp": "2025-07-18"
             }
             
         except Exception as e:
-            logger.error(f"Error calling Scale API: {e}")
+            logger.error(f"Error calling Pre-Filter API: {e}")
             return {
                 "vector_data": vector_data,
-                "scale_data": None,
-                "error": f"Error calling Scale API: {str(e)}"
+                "filtered_data": None,
+                "error": f"Error calling Pre-Filter API: {str(e)}"
             }
     
     except HTTPException:
