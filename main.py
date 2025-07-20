@@ -30,7 +30,7 @@ app.add_middleware(
 )
 
 VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
-PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/pre-filter/"
+PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/pre-scale/"
 
 @app.post("/process/")
 async def process_pdf(file: UploadFile):
