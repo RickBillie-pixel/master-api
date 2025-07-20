@@ -17,7 +17,7 @@ PORT = int(os.environ.get("PORT", 10000))
 app = FastAPI(
     title="Master API",
     description="Processes PDF by calling Vector Drawing API and Pre-Filter API",
-    version="1.0.1"
+    version="1.0.2"
 )
 
 # CORS middleware
@@ -35,6 +35,9 @@ PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/pre-scale"
 @app.post("/process/")
 async def process_pdf(file: UploadFile):
     """Process PDF: Extract vectors via Vector Drawing API, then filter via Pre-Filter API"""
+    filtered_data = None
+    vector_data = None
+    
     try:
         logger.info(f"Received file: {file.filename}")
         
@@ -83,25 +86,29 @@ async def process_pdf(file: UploadFile):
             raise HTTPException(status_code=400, detail="Vector Drawing API response missing required fields")
         
         # Step 2: Send the complete Vector Drawing API output to Pre-Filter API
-        # The Pre-Filter API expects the full Vector Drawing API output format
-        temp_file_path = f"/tmp/vector_output_{uuid.uuid4()}.json"
+        # Send JSON data directly instead of file upload
         try:
-            # Save Vector Drawing API output to temporary file
-            with open(temp_file_path, 'w') as f:
-                json.dump(vector_data, f)
+            logger.info("Calling Pre-Filter API with JSON data")
+            headers = {'Content-Type': 'application/json'}
+            filter_response = requests.post(
+                PRE_FILTER_API_URL, 
+                json=vector_data,  # Send JSON directly
+                headers=headers,
+                timeout=300
+            )
             
-            logger.info(f"Saved Vector Drawing API output to {temp_file_path}")
-            
-            # Send to Pre-Filter API
-            with open(temp_file_path, 'rb') as f:
-                filter_files = {'file': (f'vector_output_{file.filename}.json', f, 'application/json')}
-                logger.info("Calling Pre-Filter API")
-                filter_response = requests.post(PRE_FILTER_API_URL, files=filter_files, timeout=300)
+            logger.info(f"Pre-Filter API response status: {filter_response.status_code}")
             
             if filter_response.status_code != 200:
                 logger.error(f"Pre-Filter API error: {filter_response.status_code} - {filter_response.text}")
-                # Return ONLY the filtered data
-                return filtered_data
+                # Return original vector data if filtering fails
+                logger.warning("Returning original vector data due to filter API failure")
+                return {
+                    "status": "partial_success",
+                    "message": "Vector extraction successful, but scale filtering failed",
+                    "data": vector_data,
+                    "filter_error": filter_response.text
+                }
             
             # Parse Pre-Filter API response
             try:
@@ -109,25 +116,43 @@ async def process_pdf(file: UploadFile):
                 logger.info("Pre-Filter API response parsed successfully")
                 
                 # Log filtering statistics
-                if 'summary' in filtered_data:
-                    summary = filtered_data['summary']
-                    logger.info(f"Filtering stats: {summary.get('total_lines', 0)} lines kept out of {summary.get('original_lines', 0)}")
+                if 'processing_stats' in filtered_data:
+                    stats = filtered_data['processing_stats']
+                    logger.info(f"Processing stats: {stats}")
+                
+                # Return the filtered data with success status
+                return {
+                    "status": "success",
+                    "message": "PDF processed successfully through both APIs",
+                    "data": filtered_data
+                }
                 
             except Exception as e:
                 logger.error(f"Error parsing Pre-Filter API response: {e}")
-                # Return ONLY the filtered data (even on parse error)
-                return vector_data  # Return original if filter parsing fails
+                # Return original vector data if filter parsing fails
+                return {
+                    "status": "partial_success",
+                    "message": "Vector extraction successful, but scale filter response parsing failed",
+                    "data": vector_data,
+                    "filter_error": str(e)
+                }
             
-            # Return ONLY the filtered data
-            return filtered_data
-            
-        finally:
-            # Clean up temp file
-            if os.path.exists(temp_file_path):
-                try:
-                    os.unlink(temp_file_path)
-                except Exception as e:
-                    logger.warning(f"Failed to delete temp file: {e}")
+        except requests.exceptions.Timeout:
+            logger.error("Pre-Filter API timeout")
+            return {
+                "status": "partial_success",
+                "message": "Vector extraction successful, but scale filtering timed out",
+                "data": vector_data,
+                "filter_error": "Timeout"
+            }
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Pre-Filter API request error: {e}")
+            return {
+                "status": "partial_success",
+                "message": "Vector extraction successful, but scale filtering failed",
+                "data": vector_data,
+                "filter_error": str(e)
+            }
     
     except HTTPException:
         raise
@@ -137,7 +162,7 @@ async def process_pdf(file: UploadFile):
 
 @app.get("/health/")
 async def health():
-    return {"status": "healthy", "version": "1.0.1"}
+    return {"status": "healthy", "version": "1.0.2"}
 
 @app.get("/")
 async def root():
