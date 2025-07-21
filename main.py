@@ -114,7 +114,7 @@ async def process_pdf(
         
         files = {'file': (file.filename, file_content, 'application/pdf')}
         params = {
-            'minify': 'false',
+            'minify': 'true',
             'remove_non_essential': 'false',
             'precision': '2'
         }
