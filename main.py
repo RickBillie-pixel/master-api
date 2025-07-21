@@ -1,7 +1,7 @@
 import os
 import tempfile
 import uuid
-from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi import FastAPI, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import requests
@@ -16,8 +16,8 @@ PORT = int(os.environ.get("PORT", 10000))
 
 app = FastAPI(
     title="Master API",
-    description="Processes PDF by calling Vector Drawing API and Scale API",
-    version="1.0.0"
+    description="Processes PDF by calling Vector Drawing API and Pre-Filter API",
+    version="1.0.3"
 )
 
 # CORS middleware
@@ -29,20 +29,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
-SCALE_API_URL = "https://scale-api-69gl.onrender.com/extract-scale/"
+VECTOR_API_URL = "https://vector-drawing.onrender.com/extract/"
+PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/pre-scale"
 
 @app.post("/process/")
-async def process_pdf(file: UploadFile):
-    """Process PDF: Extract vectors via Vector Drawing API, save to JSON, then calculate scale via Scale API"""
+async def process_pdf(file: UploadFile, vision_output: str = Form(...)):
+    """Process PDF: Extract vectors via Vector Drawing API, combine with vision output, then filter via Pre-Filter API"""
+    filtered_data = None
+    vector_data = None
+    
     try:
         logger.info(f"Received file: {file.filename}")
         
-        # Step 1: Call Vector Drawing API with specified parameters
+        # Step 1: Parse vision_output
+        try:
+            vision_output_dict = json.loads(vision_output)
+            logger.info("Vision output parsed successfully")
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing error for vision_output: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid vision_output JSON: {str(e)}")
+        
+        # Step 2: Call Vector Drawing API
         file_content = await file.read()
         files = {'file': (file.filename, file_content, 'application/pdf')}
         params = {
-            'minify': 'false',  # Use non-minified output
+            'minify': 'true',  # Minify aan, zoals je vroeg
             'remove_non_essential': 'false',
             'precision': '2'
         }
@@ -56,137 +67,99 @@ async def process_pdf(file: UploadFile):
                 detail=f"Vector Drawing API error: {vector_response.text}"
             )
         
-        # Get the raw response text
+        # Parse Vector Drawing API response
         raw_response = vector_response.text
-        logger.info(f"Raw Vector Drawing API response (first 100 chars): {raw_response[:100]}")
-        logger.info(f"Response length: {len(raw_response)} bytes")
+        logger.info(f"Vector Drawing API response length: {len(raw_response)} bytes")
         
-        # Don't use requests.json() - explicitly parse the JSON string
         try:
-            # Use standard json module to parse
             vector_data = json.loads(raw_response)
-            logger.info(f"JSON parsed successfully, type={type(vector_data)}")
-            logger.info(f"Top-level keys: {list(vector_data.keys()) if isinstance(vector_data, dict) else 'Not a dict'}")
-            
-            # Double-check if we need to parse again (in case of double-encoding)
             if isinstance(vector_data, str):
-                logger.warning("Parsed result is still a string, attempting to parse again")
+                logger.warning("Response is double-encoded, parsing again")
                 vector_data = json.loads(vector_data)
-                logger.info(f"Second parse: type={type(vector_data)}")
-                logger.info(f"Second parse keys: {list(vector_data.keys()) if isinstance(vector_data, dict) else 'Not a dict'}")
+            logger.info("Parsed Vector Drawing API response successfully")
         except Exception as e:
             logger.error(f"JSON parsing error: {e}")
-            # Save problematic response for debugging
-            debug_path = f"/tmp/vector_response_{uuid.uuid4()}.json"
-            with open(debug_path, 'w') as f:
-                f.write(raw_response)
-            logger.info(f"Saved problematic response to {debug_path}")
             raise HTTPException(status_code=500, detail=f"Failed to parse Vector Drawing API response: {str(e)}")
         
-        # Ensure we have the expected structure
+        # Validate structure
         if not isinstance(vector_data, dict):
-            raise HTTPException(status_code=400, detail="Parsed result is not a dictionary")
+            raise HTTPException(status_code=400, detail="Vector Drawing API response is not a dictionary")
             
-        if 'pages' not in vector_data or not vector_data['pages']:
-            raise HTTPException(status_code=400, detail="No pages found in vector data")
-            
-        # Get the first page
-        page = vector_data['pages'][0]
+        if 'pages' not in vector_data or 'metadata' not in vector_data:
+            raise HTTPException(status_code=400, detail="Vector Drawing API response missing required fields")
         
-        # Extract drawings and texts
-        drawings = page.get('drawings', {})
-        texts = page.get('texts', [])
-        
-        logger.info(f"Found {len(texts)} texts and drawing types: {list(drawings.keys())}")
-        
-        # Prepare data for Scale API
-        vector_data_for_scale = {
-            "vector_data": [],
-            "texts": []
+        # Step 3: Combine data
+        combined_data = {
+            "vision_output": vision_output_dict,
+            "vector_output": vector_data,
+            "page_size": vector_data.get('metadata', {}).get('pdf_dimensions', {}).get('max_width_points', 0),  # Voorbeeld, pas aan
+            "bounding_box": vector_data.get('summary', {}).get('coordinate_bounds', [0, 0, 0, 0])
         }
+        logger.info("Data combined successfully")
         
-        # Process lines from drawings
-        if 'lines' in drawings and isinstance(drawings['lines'], list):
-            for line in drawings['lines']:
-                if 'p1' in line and 'p2' in line:
-                    vector_data_for_scale["vector_data"].append({
-                        "type": line.get("type", "line"),
-                        "p1": line["p1"],
-                        "p2": line["p2"],
-                        "length": line.get("length")
-                    })
+        # Step 4: Send to Pre-Filter API
+        logger.info("Calling Pre-Filter API with JSON data")
+        headers = {'Content-Type': 'application/json'}
+        filter_response = requests.post(
+            PRE_FILTER_API_URL, 
+            json=combined_data,
+            headers=headers,
+            timeout=300
+        )
         
-        # Process texts
-        for text in texts:
-            if 'text' in text and 'position' in text:
-                vector_data_for_scale["texts"].append({
-                    "text": text["text"],
-                    "position": text["position"]
-                })
+        logger.info(f"Pre-Filter API response status: {filter_response.status_code}")
         
-        logger.info(f"Prepared {len(vector_data_for_scale['vector_data'])} vectors and {len(vector_data_for_scale['texts'])} texts for Scale API")
+        if filter_response.status_code != 200:
+            logger.error(f"Pre-Filter API error: {filter_response.status_code} - {filter_response.text}")
+            # Return partial success
+            return {
+                "status": "partial_success",
+                "message": "Vector extraction successful, but pre-filtering failed",
+                "data": combined_data,
+                "filter_error": filter_response.text
+            }
         
-        # Save to temporary file
-        temp_file_path = f"/tmp/scale_input_{uuid.uuid4()}.json"
-        with open(temp_file_path, 'w') as f:
-            json.dump(vector_data_for_scale, f)
-        
-        logger.info(f"Saved input for Scale API to {temp_file_path}")
-        
-        # Call Scale API
+        # Parse Pre-Filter response
         try:
-            with open(temp_file_path, 'rb') as f:
-                scale_files = {'file': (os.path.basename(temp_file_path), f, 'application/json')}
-                logger.info("Calling Scale API")
-                scale_response = requests.post(SCALE_API_URL, files=scale_files, timeout=300)
-            
-            # Clean up temp file
-            os.unlink(temp_file_path)
-            
-            if scale_response.status_code != 200:
-                logger.warning(f"Scale API error: {scale_response.status_code}")
-                return {
-                    "vector_data": vector_data,
-                    "scale_data": None,
-                    "error": scale_response.text
-                }
-            
-            # Parse Scale API response
-            try:
-                scale_data = scale_response.json()
-                logger.info("Scale API response parsed successfully")
-            except Exception as e:
-                logger.error(f"Error parsing Scale API response: {e}")
-                return {
-                    "vector_data": vector_data,
-                    "scale_data": None,
-                    "error": f"Error parsing Scale API response: {str(e)}"
-                }
-            
-            # Return combined results
-            return {
-                "vector_data": vector_data,
-                "scale_data": scale_data,
-                "timestamp": "2025-07-18"
-            }
-            
+            filtered_data = filter_response.json()
+            logger.info("Pre-Filter API response parsed successfully")
         except Exception as e:
-            logger.error(f"Error calling Scale API: {e}")
+            logger.error(f"Error parsing Pre-Filter API response: {e}")
             return {
-                "vector_data": vector_data,
-                "scale_data": None,
-                "error": f"Error calling Scale API: {str(e)}"
+                "status": "partial_success",
+                "message": "Vector extraction successful, but pre-filter response parsing failed",
+                "data": combined_data,
+                "filter_error": str(e)
             }
+        
+        # Return success
+        return {
+            "status": "success",
+            "message": "PDF processed successfully through both APIs",
+            "data": filtered_data
+        }
     
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.error(f"Unexpected error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health/")
 async def health():
-    return {"status": "healthy", "version": "1.0"}
+    return {"status": "healthy", "version": "1.0.3"}
+
+@app.get("/")
+async def root():
+    return {
+        "title": "Master API",
+        "description": "Processes PDFs through Vector Drawing API and Pre-Filter API",
+        "endpoints": {
+            "/": "This page",
+            "/process/": "POST - Process PDF file",
+            "/health/": "GET - Health check"
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn
