@@ -7,8 +7,11 @@ from fastapi import FastAPI, UploadFile, HTTPException, Form, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from typing import Dict, Any
 import asyncio
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -19,7 +22,7 @@ PORT = int(os.environ.get("PORT", 10000))
 app = FastAPI(
     title="Master API",
     description="Processes PDF by calling Vector Drawing API and Pre-Filter API",
-    version="1.0.3"
+    version="1.0.4"
 )
 
 # CORS middleware
@@ -31,44 +34,164 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API URLs - Updated with correct endpoints
+# API URLs
 VECTOR_API_URL = "https://vector-drawing.onrender.com/extract/"
 PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/pre-scale"
 
-# Add timeout and retry logic
-REQUEST_TIMEOUT = 300  # 5 minutes
+# Enhanced timeout and retry settings
+REQUEST_TIMEOUT = 600  # 10 minutes for large PDFs
+CONNECT_TIMEOUT = 30   # 30 seconds for connection
 MAX_RETRIES = 3
+CHUNK_SIZE = 8192
+
+def create_robust_session():
+    """Create a requests session with robust retry strategy"""
+    session = requests.Session()
+    
+    # Define retry strategy
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        status_forcelist=[429, 500, 502, 503, 504],
+        method_whitelist=["HEAD", "GET", "OPTIONS", "POST"],
+        backoff_factor=2,
+        raise_on_status=False
+    )
+    
+    # Mount adapter with retry strategy
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=10,
+        pool_maxsize=20,
+        pool_block=False
+    )
+    
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    return session
+
+async def call_vector_api_robust(file_content: bytes, filename: str, params: dict):
+    """Robust API call specifically for Vector Drawing API"""
+    
+    for attempt in range(MAX_RETRIES):
+        session = None
+        try:
+            logger.info(f"Vector API attempt {attempt + 1}/{MAX_RETRIES}")
+            logger.info(f"File size: {len(file_content)} bytes, Filename: {filename}")
+            
+            # Create robust session
+            session = create_robust_session()
+            
+            # Prepare files and data
+            files = {'file': (filename, file_content, 'application/pdf')}
+            
+            # Set comprehensive headers
+            headers = {
+                'User-Agent': 'Master-API/1.0.4',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive'
+            }
+            
+            logger.info(f"Making POST request to {VECTOR_API_URL}")
+            logger.info(f"Params: {params}")
+            
+            # Make request with extended timeouts
+            response = session.post(
+                VECTOR_API_URL,
+                files=files,
+                params=params,
+                headers=headers,
+                timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT),
+                stream=False,  # Don't stream to avoid incomplete reads
+                verify=True
+            )
+            
+            logger.info(f"Vector API response status: {response.status_code}")
+            logger.info(f"Response headers: {dict(response.headers)}")
+            
+            if response.status_code == 200:
+                logger.info(f"Success! Response size: {len(response.content)} bytes")
+                return response
+            else:
+                logger.error(f"Non-200 status: {response.status_code}")
+                logger.error(f"Response text: {response.text[:500]}...")
+                
+                if attempt == MAX_RETRIES - 1:
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=f"Vector API failed with status {response.status_code}: {response.text[:200]}"
+                    )
+            
+        except requests.exceptions.Timeout as e:
+            logger.warning(f"Timeout on attempt {attempt + 1}: {str(e)}")
+            if attempt == MAX_RETRIES - 1:
+                raise HTTPException(
+                    status_code=504, 
+                    detail=f"Vector API timeout after {MAX_RETRIES} attempts. Large PDF may need more time."
+                )
+                
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"Connection error on attempt {attempt + 1}: {str(e)}")
+            if attempt == MAX_RETRIES - 1:
+                raise HTTPException(
+                    status_code=503, 
+                    detail=f"Vector API connection failed after {MAX_RETRIES} attempts: {str(e)}"
+                )
+                
+        except requests.exceptions.ChunkedEncodingError as e:
+            logger.warning(f"Chunked encoding error on attempt {attempt + 1}: {str(e)}")
+            if attempt == MAX_RETRIES - 1:
+                raise HTTPException(
+                    status_code=502, 
+                    detail=f"Vector API response incomplete after {MAX_RETRIES} attempts"
+                )
+                
+        except Exception as e:
+            logger.error(f"Unexpected error on attempt {attempt + 1}: {str(e)}")
+            if attempt == MAX_RETRIES - 1:
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Vector API failed: {str(e)}"
+                )
+        
+        finally:
+            if session:
+                session.close()
+        
+        # Wait before retry
+        if attempt < MAX_RETRIES - 1:
+            wait_time = (2 ** attempt) + 1  # Exponential backoff + 1
+            logger.info(f"Waiting {wait_time}s before retry...")
+            await asyncio.sleep(wait_time)
 
 async def call_api_with_retry(url: str, method: str = "POST", **kwargs):
-    """Call API with retry logic"""
+    """Generic API call with retry logic"""
     for attempt in range(MAX_RETRIES):
+        session = None
         try:
-            logger.info(f"Attempting API call to {url} (attempt {attempt + 1}/{MAX_RETRIES})")
+            logger.info(f"API call to {url} (attempt {attempt + 1}/{MAX_RETRIES})")
+            
+            session = create_robust_session()
             
             if method == "POST":
-                response = requests.post(url, timeout=REQUEST_TIMEOUT, **kwargs)
+                response = session.post(url, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT), **kwargs)
             else:
-                response = requests.get(url, timeout=REQUEST_TIMEOUT, **kwargs)
+                response = session.get(url, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT), **kwargs)
             
             return response
             
-        except requests.exceptions.Timeout:
-            logger.warning(f"Timeout on attempt {attempt + 1} for {url}")
-            if attempt == MAX_RETRIES - 1:
-                raise HTTPException(status_code=504, detail=f"API timeout after {MAX_RETRIES} attempts")
-            await asyncio.sleep(2 ** attempt)  # Exponential backoff
-            
-        except requests.exceptions.ConnectionError as e:
-            logger.warning(f"Connection error on attempt {attempt + 1} for {url}: {str(e)}")
-            if attempt == MAX_RETRIES - 1:
-                raise HTTPException(status_code=503, detail=f"Service unavailable after {MAX_RETRIES} attempts")
-            await asyncio.sleep(2 ** attempt)
-            
         except Exception as e:
-            logger.error(f"Unexpected error on attempt {attempt + 1} for {url}: {str(e)}")
+            logger.error(f"API call error on attempt {attempt + 1}: {str(e)}")
             if attempt == MAX_RETRIES - 1:
                 raise HTTPException(status_code=500, detail=f"API call failed: {str(e)}")
-            await asyncio.sleep(1)
+        
+        finally:
+            if session:
+                session.close()
+        
+        if attempt < MAX_RETRIES - 1:
+            await asyncio.sleep(2 ** attempt)
 
 @app.post("/process/")
 async def process_pdf(
@@ -77,12 +200,12 @@ async def process_pdf(
 ):
     """Process PDF: Extract vectors via Vector Drawing API, combine data, and filter via Pre-Filter API"""
     
+    start_time = time.time()
+    
     try:
         logger.info(f"=== Starting PDF Processing ===")
         logger.info(f"Received file: {file.filename}")
-        logger.info(f"File size: {file.size if hasattr(file, 'size') else 'unknown'} bytes")
-        logger.info(f"Vision output length: {len(vision_output)} chars")
-
+        
         # Step 1: Validate file
         if not file.filename:
             raise HTTPException(status_code=400, detail="No file provided")
@@ -104,38 +227,32 @@ async def process_pdf(
             if not file_content:
                 raise HTTPException(status_code=400, detail="Empty file received")
             
-            logger.info(f"File content read successfully: {len(file_content)} bytes")
+            file_size_mb = len(file_content) / (1024 * 1024)
+            logger.info(f"File content read successfully: {len(file_content)} bytes ({file_size_mb:.2f} MB)")
+            
+            # Warn about large files
+            if file_size_mb > 5:
+                logger.warning(f"Large PDF detected ({file_size_mb:.2f} MB) - processing may take longer")
+                
         except Exception as e:
             logger.error(f"Error reading file: {str(e)}")
             raise HTTPException(status_code=400, detail=f"Failed to read file: {str(e)}")
 
-        # Step 4: Call Vector Drawing API
+        # Step 4: Call Vector Drawing API with robust handling
         logger.info("=== Calling Vector Drawing API ===")
         
-        files = {'file': (file.filename, file_content, 'application/pdf')}
         params = {
-            'minify': 'false',
+            'minify': 'true',
             'remove_non_essential': 'false',
             'precision': '2'
         }
         
         try:
-            vector_response = await call_api_with_retry(
-                VECTOR_API_URL,
-                method="POST",
-                files=files,
-                params=params
-            )
+            vector_response = await call_vector_api_robust(file_content, file.filename, params)
             
-            logger.info(f"Vector API response status: {vector_response.status_code}")
-            
-            if vector_response.status_code != 200:
-                logger.error(f"Vector API error: {vector_response.status_code} - {vector_response.text}")
-                raise HTTPException(
-                    status_code=vector_response.status_code,
-                    detail=f"Vector Drawing API error: {vector_response.text}"
-                )
-            
+            if not vector_response:
+                raise HTTPException(status_code=500, detail="Vector API returned no response")
+                
         except HTTPException:
             raise
         except Exception as e:
@@ -147,7 +264,7 @@ async def process_pdf(
             raw_response = vector_response.text
             logger.info(f"Vector API response length: {len(raw_response)} chars")
             
-            # Handle both string and dict responses
+            # Handle minified JSON response
             if raw_response.startswith('"') and raw_response.endswith('"'):
                 # Response is a JSON string that needs double parsing
                 vector_data = json.loads(json.loads(raw_response))
@@ -159,12 +276,6 @@ async def process_pdf(
             # Validate response structure
             if not isinstance(vector_data, dict):
                 raise ValueError("Response is not a dictionary")
-            
-            if 'pages' not in vector_data:
-                logger.warning("No 'pages' key in vector response")
-            
-            if 'metadata' not in vector_data:
-                logger.warning("No 'metadata' key in vector response")
                 
         except Exception as e:
             logger.error(f"Vector API response parsing error: {str(e)}")
@@ -176,33 +287,27 @@ async def process_pdf(
 
         # Step 6: Extract coordinate bounds and page info
         try:
-            # Get coordinate bounds from summary
             coordinate_bounds = vector_data.get('summary', {}).get('coordinate_bounds', {})
-            
-            # Get page dimensions
-            page_dimensions = {}
-            if 'pages' in vector_data and len(vector_data['pages']) > 0:
-                first_page = vector_data['pages'][0]
-                page_dimensions = first_page.get('page_dimensions', {})
-                if not page_dimensions and 'page_size' in first_page:
-                    page_dimensions = first_page['page_size']
+            pdf_dimensions = vector_data.get('metadata', {}).get('pdf_dimensions', {})
             
             logger.info(f"Coordinate bounds: {coordinate_bounds}")
-            logger.info(f"Page dimensions: {page_dimensions}")
+            logger.info(f"PDF dimensions: {pdf_dimensions}")
             
         except Exception as e:
             logger.warning(f"Error extracting coordinate info: {str(e)}")
             coordinate_bounds = {}
-            page_dimensions = {}
+            pdf_dimensions = {}
 
         # Step 7: Combine data for Pre-Filter API
         combined_data = {
             "vision_output": vision_output_dict,
             "vector_output": vector_data,
             "coordinate_bounds": coordinate_bounds,
-            "page_dimensions": page_dimensions,
+            "pdf_dimensions": pdf_dimensions,
             "metadata": {
                 "filename": file.filename,
+                "file_size_mb": file_size_mb,
+                "processing_time_vector_ms": int((time.time() - start_time) * 1000),
                 "total_pages": vector_data.get('summary', {}).get('total_pages', 1),
                 "total_texts": vector_data.get('summary', {}).get('total_texts', 0),
                 "dimensions_found": vector_data.get('summary', {}).get('dimensions_found', 0)
@@ -235,10 +340,7 @@ async def process_pdf(
                         "message": "Vector extraction successful, but scale filtering failed",
                         "data": combined_data,
                         "filter_error": filter_response.text,
-                        "vector_summary": {
-                            "total_texts": vector_data.get('summary', {}).get('total_texts', 0),
-                            "coordinate_bounds": coordinate_bounds
-                        }
+                        "processing_time_ms": int((time.time() - start_time) * 1000)
                     }
                 )
             
@@ -257,15 +359,13 @@ async def process_pdf(
                     "message": "Vector extraction successful, but scale filtering failed",
                     "data": combined_data,
                     "filter_error": str(e),
-                    "vector_summary": {
-                        "total_texts": vector_data.get('summary', {}).get('total_texts', 0),
-                        "coordinate_bounds": coordinate_bounds
-                    }
+                    "processing_time_ms": int((time.time() - start_time) * 1000)
                 }
             )
 
         # Step 9: Return successful result
-        logger.info("=== PDF Processing Completed Successfully ===")
+        total_time = int((time.time() - start_time) * 1000)
+        logger.info(f"=== PDF Processing Completed Successfully in {total_time}ms ===")
         
         return JSONResponse(
             status_code=200,
@@ -274,6 +374,8 @@ async def process_pdf(
                 "message": "PDF processed successfully through both APIs",
                 "data": filtered_data,
                 "metadata": {
+                    "processing_time_ms": total_time,
+                    "file_size_mb": file_size_mb,
                     "processing_summary": {
                         "total_texts": vector_data.get('summary', {}).get('total_texts', 0),
                         "dimensions_found": vector_data.get('summary', {}).get('dimensions_found', 0),
@@ -374,61 +476,6 @@ if __name__ == "__main__":
     logger.info(f"Starting Enhanced Master API on port {PORT}")
     logger.info("Features: Robust error handling, extended timeouts, connection pooling")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
-                "pre_filter_api": "unknown"
-            }
-        }
-        
-        # Quick health check for Vector API
-        try:
-            vector_health_response = requests.get(
-                "https://vector-drawing.onrender.com/health/",
-                timeout=10
-            )
-            health_status["services"]["vector_api"] = "healthy" if vector_health_response.status_code == 200 else "unhealthy"
-        except:
-            health_status["services"]["vector_api"] = "unreachable"
-        
-        # Quick health check for Pre-Filter API  
-        try:
-            filter_health_response = requests.get(
-                "https://pre-filter-scale-api.onrender.com/health/",
-                timeout=10
-            )
-            health_status["services"]["pre_filter_api"] = "healthy" if filter_health_response.status_code == 200 else "unhealthy"
-        except:
-            health_status["services"]["pre_filter_api"] = "unreachable"
-        
-        return health_status
-        
-    except Exception as e:
-        logger.error(f"Health check error: {str(e)}")
-        return {"status": "unhealthy", "error": str(e)}
-
-@app.get("/")
-async def root():
-    """Root endpoint with API information"""
-    return {
-        "title": "Master API",
-        "version": "1.0.3",
-        "description": "Processes PDFs through Vector Drawing API and Pre-Filter API",
-        "endpoints": {
-            "/": "This page",
-            "/process/": "POST - Process PDF file with vision output",
-            "/health/": "GET - Health check with service status"
-        },
-        "external_services": {
-            "vector_drawing_api": VECTOR_API_URL,
-            "pre_filter_api": PRE_FILTER_API_URL
-        },
-        "request_format": {
-            "method": "POST",
-            "content_type": "multipart/form-data",
-            "fields": {
-                "file": "PDF file (binary)",
-                "vision_output": "JSON string with vision analysis"
-            }
-        }
-    }
 
 if __name__ == "__main__":
     import uvicorn
