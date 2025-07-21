@@ -359,3 +359,8 @@ if __name__ == "__main__":
     import uvicorn
     logger.info(f"Starting Master API on port {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info(f"Starting Master API on port {PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
