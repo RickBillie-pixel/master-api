@@ -9,7 +9,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from typing import Dict, Any
 import asyncio
 
@@ -44,21 +43,11 @@ CONNECT_TIMEOUT = 30   # 30 seconds for connection
 MAX_RETRIES = 3
 
 def create_robust_session():
-    """Create a requests session with robust retry strategy"""
+    """Create a requests session with basic retry strategy"""
     session = requests.Session()
     
-    # Define retry strategy
-    retry_strategy = Retry(
-        total=MAX_RETRIES,
-        status_forcelist=[429, 500, 502, 503, 504],
-        method_whitelist=["HEAD", "GET", "OPTIONS", "POST"],
-        backoff_factor=2,
-        raise_on_status=False
-    )
-    
-    # Mount adapter with retry strategy
+    # Simple adapter without complex retry strategy to avoid version conflicts
     adapter = HTTPAdapter(
-        max_retries=retry_strategy,
         pool_connections=10,
         pool_maxsize=20,
         pool_block=False
