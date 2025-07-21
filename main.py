@@ -114,7 +114,7 @@ async def process_pdf(
         
         files = {'file': (file.filename, file_content, 'application/pdf')}
         params = {
-            'minify': 'true',
+            'minify': 'false',
             'remove_non_essential': 'false',
             'precision': '2'
         }
@@ -291,14 +291,89 @@ async def process_pdf(
 
 @app.get("/health/")
 async def health():
-    """Health check endpoint"""
+    """Enhanced health check endpoint"""
     try:
-        # Test connection to external APIs
         health_status = {
             "status": "healthy",
-            "version": "1.0.3",
+            "version": "1.0.4",
             "services": {
                 "vector_api": "unknown",
+                "pre_filter_api": "unknown"
+            },
+            "capabilities": {
+                "max_pdf_size_mb": 10,
+                "timeout_minutes": 10,
+                "retry_attempts": MAX_RETRIES
+            }
+        }
+        
+        # Quick health check for Vector API
+        try:
+            session = create_robust_session()
+            vector_health_response = session.get(
+                "https://vector-drawing.onrender.com/health/",
+                timeout=10
+            )
+            health_status["services"]["vector_api"] = "healthy" if vector_health_response.status_code == 200 else "unhealthy"
+            session.close()
+        except:
+            health_status["services"]["vector_api"] = "unreachable"
+        
+        # Quick health check for Pre-Filter API  
+        try:
+            session = create_robust_session()
+            filter_health_response = session.get(
+                "https://pre-filter-scale-api.onrender.com/health/",
+                timeout=10
+            )
+            health_status["services"]["pre_filter_api"] = "healthy" if filter_health_response.status_code == 200 else "unhealthy"
+            session.close()
+        except:
+            health_status["services"]["pre_filter_api"] = "unreachable"
+        
+        return health_status
+        
+    except Exception as e:
+        logger.error(f"Health check error: {str(e)}")
+        return {"status": "unhealthy", "error": str(e)}
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "title": "Master API",
+        "version": "1.0.4",
+        "description": "Processes PDFs through Vector Drawing API and Pre-Filter API with robust error handling",
+        "endpoints": {
+            "/": "This page",
+            "/process/": "POST - Process PDF file with vision output",
+            "/health/": "GET - Health check with service status"
+        },
+        "external_services": {
+            "vector_drawing_api": VECTOR_API_URL,
+            "pre_filter_api": PRE_FILTER_API_URL
+        },
+        "request_format": {
+            "method": "POST",
+            "content_type": "multipart/form-data",
+            "fields": {
+                "file": "PDF file (binary)",
+                "vision_output": "JSON string with vision analysis"
+            }
+        },
+        "improvements": {
+            "robust_session": "Uses connection pooling and retry strategies",
+            "timeout_handling": "Extended timeouts for large PDFs (10 minutes)",
+            "error_recovery": "Handles IncompleteRead and connection errors",
+            "partial_success": "Returns vector data even if filtering fails"
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info(f"Starting Enhanced Master API on port {PORT}")
+    logger.info("Features: Robust error handling, extended timeouts, connection pooling")
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
                 "pre_filter_api": "unknown"
             }
         }
@@ -354,11 +429,6 @@ async def root():
             }
         }
     }
-
-if __name__ == "__main__":
-    import uvicorn
-    logger.info(f"Starting Master API on port {PORT}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
     import uvicorn
