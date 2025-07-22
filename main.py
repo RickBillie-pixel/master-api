@@ -31,70 +31,150 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API URLs
-VECTOR_API_URL = "https://vector-drawing.onrender.com/extract/"
+# API URLs - CORRECT: Using actual deployed URL
+VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"  # Correct URL as confirmed
 PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/pre-scale"
+
+# Add DNS and connectivity debugging
+def test_vector_api_connectivity():
+    """Test basic connectivity to Vector API"""
+    try:
+        import socket
+        
+        # Test DNS resolution
+        host = "vector-drawning.onrender.com"
+        ip = socket.gethostbyname(host)
+        logger.info(f"DNS resolution: {host} -> {ip}")
+        
+        # Test basic HTTP connectivity
+        test_url = f"https://{host}/"
+        response = requests.get(test_url, timeout=10)
+        logger.info(f"Basic connectivity test: {response.status_code}")
+        
+        # Test health endpoint
+        health_url = f"https://{host}/health/"
+        health_response = requests.get(health_url, timeout=10)
+        logger.info(f"Health endpoint test: {health_response.status_code}")
+        logger.info(f"Health response: {health_response.text}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Connectivity test failed: {e}")
+        return False
 
 # Retry settings
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 600  # 10 minutes
 
 async def call_vector_api_with_retry(file_content: bytes, filename: str, params: dict) -> requests.Response:
-    """Call Vector Drawing API with robust retry logic"""
+    """Call Vector Drawing API with robust retry logic and detailed debugging"""
+    
+    logger.info(f"=== Vector API Call Details ===")
+    logger.info(f"URL: {VECTOR_API_URL}")
+    logger.info(f"File: {filename} ({len(file_content)} bytes)")
+    logger.info(f"Params: {params}")
+    
+    # Test connectivity first
+    logger.info("=== Testing Vector API Connectivity ===")
+    connectivity_ok = test_vector_api_connectivity()
+    if not connectivity_ok:
+        logger.error("❌ Basic connectivity test failed!")
+    else:
+        logger.info("✅ Basic connectivity test passed")
     
     for attempt in range(MAX_RETRIES):
         try:
-            logger.info(f"Vector API attempt {attempt + 1}/{MAX_RETRIES}")
+            logger.info(f"=== Vector API Attempt {attempt + 1}/{MAX_RETRIES} ===")
             
-            # Prepare request
+            # Wake up the service with a simple GET first
+            try:
+                wake_url = "https://vector-drawning.onrender.com/"
+                logger.info(f"🔄 Waking up Vector API service...")
+                wake_response = requests.get(wake_url, timeout=30)
+                logger.info(f"Wake response: {wake_response.status_code}")
+                time.sleep(2)  # Give it a moment to wake up
+            except Exception as e:
+                logger.warning(f"Wake up request failed: {e}")
+            
+            # Prepare request with detailed logging
             files = {'file': (filename, file_content, 'application/pdf')}
             headers = {
                 'User-Agent': 'Master-API/1.2.1',
-                'Accept': '*/*',
-                'Connection': 'close'  # Force connection close to avoid incomplete reads
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'close'
             }
             
-            logger.info(f"Making request to Vector API with {len(file_content)} bytes")
+            logger.info(f"📤 Making POST request to {VECTOR_API_URL}")
+            logger.info(f"Headers: {headers}")
+            logger.info(f"Files: file='{filename}' ({len(file_content)} bytes, type='application/pdf')")
+            logger.info(f"Params: {params}")
             
-            # Make request with session that closes connections
-            session = requests.Session()
-            session.headers.update(headers)
+            # Use requests.post directly with verbose logging
+            start_time = time.time()
             
-            response = session.post(
-                VECTOR_API_URL,
-                files=files,
-                params=params,
-                timeout=REQUEST_TIMEOUT,
-                stream=False,  # Don't stream to avoid incomplete reads
-                headers={'Connection': 'close'}
-            )
+            try:
+                response = requests.post(
+                    VECTOR_API_URL,
+                    files=files,
+                    params=params,
+                    headers=headers,
+                    timeout=(30, 600),  # (connect_timeout, read_timeout)
+                    stream=False,
+                    verify=True
+                )
+                
+                request_time = time.time() - start_time
+                logger.info(f"📥 Response received after {request_time:.2f}s")
+                
+            except requests.exceptions.ConnectTimeout:
+                logger.error("❌ Connection timeout (30s)")
+                raise
+            except requests.exceptions.ReadTimeout:
+                logger.error("❌ Read timeout (600s)")
+                raise
+            except requests.exceptions.ConnectionError as e:
+                logger.error(f"❌ Connection error: {e}")
+                raise
             
-            # Close session immediately
-            session.close()
+            # Log detailed response info
+            logger.info(f"📊 Vector API Response Details:")
+            logger.info(f"  Status Code: {response.status_code}")
+            logger.info(f"  Reason: {response.reason}")
+            logger.info(f"  Headers: {dict(response.headers)}")
+            logger.info(f"  Content Length: {len(response.content)}")
+            logger.info(f"  Content Type: {response.headers.get('content-type', 'unknown')}")
             
-            logger.info(f"Vector API response: {response.status_code}, Content-Length: {len(response.content)}")
+            if response.content:
+                content_preview = response.text[:300] if response.text else str(response.content[:300])
+                logger.info(f"  Content Preview: {content_preview}...")
+            else:
+                logger.warning("  ⚠️  Empty response content!")
             
             if response.status_code == 200:
-                logger.info("Vector API call successful")
+                logger.info("✅ Vector API call successful")
                 return response
             else:
-                logger.error(f"Vector API error {response.status_code}: {response.text[:200]}")
+                logger.error(f"❌ Vector API returned {response.status_code}")
+                logger.error(f"Full response body: {response.text}")
+                
                 if attempt == MAX_RETRIES - 1:
                     raise HTTPException(
                         status_code=response.status_code,
-                        detail=f"Vector API failed after {MAX_RETRIES} attempts: {response.text[:200]}"
+                        detail=f"Vector API failed after {MAX_RETRIES} attempts. Status: {response.status_code}, Body: {response.text[:200]}"
                     )
                     
         except requests.exceptions.Timeout as e:
-            logger.warning(f"Timeout on attempt {attempt + 1}: {str(e)}")
+            logger.warning(f"⏰ Timeout on attempt {attempt + 1}: {str(e)}")
             if attempt == MAX_RETRIES - 1:
                 raise HTTPException(
                     status_code=504,
-                    detail=f"Vector API timeout after {MAX_RETRIES} attempts"
+                    detail=f"Vector API timeout after {MAX_RETRIES} attempts. The service may be overloaded or sleeping."
                 )
                 
         except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
-            logger.warning(f"Connection error on attempt {attempt + 1}: {str(e)}")
+            logger.warning(f"🔌 Connection error on attempt {attempt + 1}: {str(e)}")
             if attempt == MAX_RETRIES - 1:
                 raise HTTPException(
                     status_code=503,
@@ -102,17 +182,22 @@ async def call_vector_api_with_retry(file_content: bytes, filename: str, params:
                 )
                 
         except Exception as e:
-            logger.error(f"Unexpected error on attempt {attempt + 1}: {str(e)}")
+            logger.error(f"💥 Unexpected error on attempt {attempt + 1}")
+            logger.error(f"Error type: {type(e).__name__}")
+            logger.error(f"Error message: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            
             if attempt == MAX_RETRIES - 1:
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Vector API failed after {MAX_RETRIES} attempts: {str(e)}"
+                    detail=f"Vector API failed after {MAX_RETRIES} attempts: {type(e).__name__}: {str(e)}"
                 )
         
         # Wait before retry with exponential backoff
         if attempt < MAX_RETRIES - 1:
-            wait_time = (2 ** attempt) + 1
-            logger.info(f"Waiting {wait_time}s before retry...")
+            wait_time = min((2 ** attempt) + 1, 30)  # Cap at 30 seconds
+            logger.info(f"⏳ Waiting {wait_time}s before retry...")
             await asyncio.sleep(wait_time)
     
     # Should never reach here, but just in case
