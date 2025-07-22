@@ -16,8 +16,8 @@ PORT = int(os.environ.get("PORT", 10000))
 
 app = FastAPI(
     title="Master API",
-    description="Processes PDF by calling Vector Drawing API and Scale API, with optional vision output",
-    version="1.0.1"
+    description="Processes PDF by calling Vector Drawing API and Pre-Filter API with vision output integration",
+    version="1.1.0"
 )
 
 # CORS middleware
@@ -29,83 +29,97 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-VECTOR_API_URL = "https://vector-drawing.onrender.com/extract/"  # Corrected URL
-SCALE_API_URL = "https://scale-api-69gl.onrender.com/extract-scale/"
+# UPDATED: Pre-Filter API instead of Scale API
+VECTOR_API_URL = "https://vector-drawing.onrender.com/extract/"
+PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/pre-scale"
 
-def normalize_vision_coordinates(vector_data: Dict, vision_output: Dict) -> Dict:
-    """Normalize vision output pixel coordinates to PDF points using page size and image metadata."""
-    if not vision_output or "regions" not in vision_output or "image_metadata" not in vision_output:
-        return None
-
-    if not vector_data.get("pages") or not vector_data["pages"]:
-        logger.warning("No pages found in vector data, skipping normalization")
-        return None
-    page_metadata = vector_data["pages"][0]
-    page_width_points = page_metadata.get("page_size", {}).get("width", 3370.0)
-    page_height_points = page_metadata.get("page_size", {}).get("height", 2384.0)
-
-    image_metadata = vision_output["image_metadata"]
-    image_width_pixels = image_metadata.get("image_width_pixels", 9969)
-    image_height_pixels = image_metadata.get("image_height_pixels", 7052)
-
-    scale_x = page_width_points / image_width_pixels if image_width_pixels > 0 else 1.0
-    scale_y = page_height_points / image_height_pixels if image_height_pixels > 0 else 1.0
-
-    normalized_regions = []
-    for region in vision_output["regions"]:
-        coords = region["coordinate_block"]
-        if len(coords) != 4 or any(c < 0 for c in coords):
-            logger.warning(f"Invalid coordinates for region {region['label']}, skipping")
-            continue
-
-        x0_points = coords[0] * scale_x
-        y0_points = page_height_points - (coords[1] * scale_y)
-        x1_points = coords[2] * scale_x
-        y1_points = page_height_points - (coords[3] * scale_y)
-
-        x0_points = max(0, min(x0_points, page_width_points))
-        x1_points = max(0, min(x1_points, page_width_points))
-        y0_points = max(0, min(y0_points, page_height_points))
-        y1_points = max(0, min(y1_points, page_height_points))
-
-        normalized_regions.append({
-            "coordinate_block": [x0_points, y0_points, x1_points, y1_points],
-            "label": region["label"]
-        })
-
-    return {
-        "drawing_type": vision_output["drawing_type"],
-        "scale_api_version": vision_output["scale_api_version"],
-        "regions": normalized_regions,
-        "image_metadata": image_metadata
-    }
+def convert_image_coords_to_pdf(vision_data: Dict, pdf_dimensions: Dict) -> Dict:
+    """Convert image pixel coordinates to PDF point coordinates"""
+    
+    if not vision_data or not pdf_dimensions:
+        logger.warning("Missing vision data or PDF dimensions for coordinate conversion")
+        return vision_data
+    
+    try:
+        # Get image metadata
+        image_meta = vision_data.get("image_metadata", {})
+        image_width_px = image_meta.get("image_width_pixels", 1)
+        image_height_px = image_meta.get("image_height_pixels", 1)
+        image_dpi = image_meta.get("image_dpi_x", 213.0)
+        
+        # Get PDF dimensions from coordinate bounds or fallback
+        pdf_bounds = pdf_dimensions.get("coordinate_bounds", {})
+        pdf_width = pdf_bounds.get("width", pdf_bounds.get("max_x", 595))
+        pdf_height = pdf_bounds.get("height", pdf_bounds.get("max_y", 842))
+        
+        logger.info(f"Converting coordinates: Image {image_width_px}x{image_height_px}px @ {image_dpi}DPI to PDF {pdf_width}x{pdf_height}pts")
+        
+        # Calculate scale factors
+        scale_x = pdf_width / image_width_px
+        scale_y = pdf_height / image_height_px
+        
+        # Convert regions
+        converted_regions = []
+        for region in vision_data.get("regions", []):
+            coord_block = region.get("coordinate_block", [])
+            if len(coord_block) >= 4:
+                # Convert [x1, y1, x2, y2] from image pixels to PDF points
+                x1_pdf = coord_block[0] * scale_x
+                y1_pdf = coord_block[1] * scale_y
+                x2_pdf = coord_block[2] * scale_x
+                y2_pdf = coord_block[3] * scale_y
+                
+                converted_region = region.copy()
+                converted_region["coordinate_block_pdf"] = [
+                    round(x1_pdf, 2), 
+                    round(y1_pdf, 2), 
+                    round(x2_pdf, 2), 
+                    round(y2_pdf, 2)
+                ]
+                converted_region["coordinate_block_original"] = coord_block
+                converted_regions.append(converted_region)
+                
+                logger.info(f"Converted region '{region.get('label', 'unnamed')}': "
+                           f"{coord_block} -> [{x1_pdf:.1f}, {y1_pdf:.1f}, {x2_pdf:.1f}, {y2_pdf:.1f}]")
+        
+        # Create converted vision data
+        converted_vision = vision_data.copy()
+        converted_vision["regions"] = converted_regions
+        converted_vision["conversion_info"] = {
+            "scale_x": round(scale_x, 6),
+            "scale_y": round(scale_y, 6),
+            "pdf_dimensions": pdf_dimensions,
+            "conversion_applied": True
+        }
+        
+        return converted_vision
+        
+    except Exception as e:
+        logger.error(f"Error converting coordinates: {e}")
+        return vision_data
 
 @app.post("/process/")
 async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
-    """Process PDF: Extract vectors via Vector Drawing API, optionally normalize vision output, and send to Scale API"""
+    """Process PDF: Extract vectors, convert vision coordinates, then send to Pre-Filter API"""
     try:
         logger.info(f"Received file: {file.filename}")
         
-        # Optional vision_output handling
+        # Parse vision_output
         vision_data = None
-        normalized_vision = None
         if vision_output:
             try:
                 vision_data = json.loads(vision_output)
-                logger.info("Vision output parsed successfully")
-                normalized_vision = normalize_vision_coordinates({"pages": [{"page_size": {"width": 3370.0, "height": 2384.0}}]}, vision_data)
-                if normalized_vision:
-                    logger.info("Vision coordinates normalized successfully")
+                logger.info(f"Vision output parsed successfully - found {len(vision_data.get('regions', []))} regions")
             except json.JSONDecodeError as e:
                 logger.error(f"JSON parsing error for vision_output: {e}")
                 raise HTTPException(status_code=400, detail=f"Invalid vision_output JSON: {str(e)}")
 
-        # Step 1: Call Vector Drawing API with specified parameters
+        # Call Vector Drawing API with minify=true
         file_content = await file.read()
         files = {'file': (file.filename, file_content, 'application/pdf')}
         params = {
-            'minify': 'false',
-            'remove_non_essential': 'false',
+            'minify': 'true',  # As requested
+            'remove_non_essential': 'false', 
             'precision': '2'
         }
         
@@ -118,16 +132,14 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
                 detail=f"Vector Drawing API error: {vector_response.text}"
             )
         
-        # Get the raw response text
+        # Parse vector response
         raw_response = vector_response.text
         logger.info(f"Raw Vector Drawing API response (first 100 chars): {raw_response[:100]}")
         logger.info(f"Response length: {len(raw_response)} bytes")
         
-        # Don't use requests.json() - explicitly parse the JSON string
         try:
             vector_data = json.loads(raw_response)
             logger.info(f"JSON parsed successfully, type={type(vector_data)}")
-            logger.info(f"Top-level keys: {list(vector_data.keys()) if isinstance(vector_data, dict) else 'Not a dict'}")
             
             if isinstance(vector_data, str):
                 logger.warning("Parsed result is still a string, attempting to parse again")
@@ -142,89 +154,113 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
             logger.info(f"Saved problematic response to {debug_path}")
             raise HTTPException(status_code=500, detail=f"Failed to parse Vector Drawing API response: {str(e)}")
         
+        # Validate vector data structure
         if not isinstance(vector_data, dict):
             raise HTTPException(status_code=400, detail="Parsed result is not a dictionary")
             
         if 'pages' not in vector_data or not vector_data['pages']:
             raise HTTPException(status_code=400, detail="No pages found in vector data")
-            
-        # Get the first page
-        page = vector_data['pages'][0]
         
-        # Extract drawings and texts
-        drawings = page.get('drawings', {})
-        texts = page.get('texts', [])
+        # NEW: Convert vision coordinates if available
+        converted_vision = None
+        if vision_data:
+            # Get PDF dimensions from vector response (coordinate_bounds from enhanced vector API)
+            pdf_dimensions = vector_data.get('summary', {})
+            converted_vision = convert_image_coords_to_pdf(vision_data, pdf_dimensions)
+            logger.info("Vision coordinates converted to PDF coordinate system")
         
-        logger.info(f"Found {len(texts)} texts and drawing types: {list(drawings.keys())}")
-        
-        # Prepare data for Scale API
-        vector_data_for_scale = {
-            "vector_data": [],
-            "texts": []
+        # NEW: Prepare data for Pre-Filter API (as expected by pre-filter)
+        combined_data = {
+            "vision_output": converted_vision if converted_vision else vision_data,
+            "vector_output": vector_data,  # Raw vector data as requested
+            "coordinate_bounds": vector_data.get('summary', {}).get('coordinate_bounds', {}),
+            "pdf_dimensions": vector_data.get('metadata', {}).get('pdf_dimensions', {}),
+            "metadata": {
+                "filename": file.filename,
+                "total_pages": vector_data.get('summary', {}).get('total_pages', 1),
+                "total_texts": vector_data.get('summary', {}).get('total_texts', 0),
+                "dimensions_found": vector_data.get('summary', {}).get('dimensions_found', 0),
+                "coordinate_conversion": "applied" if converted_vision else "not_applicable"
+            }
         }
         
-        if 'lines' in drawings and isinstance(drawings['lines'], list):
-            for line in drawings['lines']:
-                if 'p1' in line and 'p2' in line:
-                    vector_data_for_scale["vector_data"].append({
-                        "type": line.get("type", "line"),
-                        "p1": line["p1"],
-                        "p2": line["p2"],
-                        "length": line.get("length")
-                    })
+        logger.info("Data combined for Pre-Filter API:")
+        logger.info(f"- Vision regions: {len(converted_vision.get('regions', []))} (converted)" if converted_vision else "- No vision data")
+        logger.info(f"- Vector pages: {len(vector_data.get('pages', []))}")
+        logger.info(f"- PDF coordinate bounds: {combined_data['coordinate_bounds']}")
         
-        for text in texts:
-            if 'text' in text and 'position' in text:
-                vector_data_for_scale["texts"].append({
-                    "text": text["text"],
-                    "position": text["position"]
-                })
-        
-        logger.info(f"Prepared {len(vector_data_for_scale['vector_data'])} vectors and {len(vector_data_for_scale['texts'])} texts for Scale API")
-        
-        # Save to temporary file
-        temp_file_path = f"/tmp/scale_input_{uuid.uuid4()}.json"
-        with open(temp_file_path, 'w') as f:
-            json.dump(vector_data_for_scale, f)
-        
-        logger.info(f"Saved input for Scale API to {temp_file_path}")
-        
-        # Call Scale API
+        # Call Pre-Filter API
         try:
-            with open(temp_file_path, 'rb') as f:
-                scale_files = {'file': (os.path.basename(temp_file_path), f, 'application/json')}
-                logger.info("Calling Scale API")
-                scale_response = requests.post(SCALE_API_URL, files=scale_files, timeout=300)
+            headers = {'Content-Type': 'application/json'}
+            logger.info("Calling Pre-Filter API with vision-enhanced data")
             
-            os.unlink(temp_file_path)
+            filter_response = requests.post(
+                PRE_FILTER_API_URL, 
+                json=combined_data, 
+                headers=headers,
+                timeout=300
+            )
             
-            if scale_response.status_code != 200:
-                logger.warning(f"Scale API error: {scale_response.status_code}")
+            logger.info(f"Pre-Filter API response status: {filter_response.status_code}")
+            
+            if filter_response.status_code != 200:
+                logger.warning(f"Pre-Filter API error: {filter_response.status_code}")
+                logger.warning(f"Error response: {filter_response.text}")
                 return {
+                    "status": "partial_success",
+                    "message": "Vector extraction successful, but pre-filtering failed",
                     "vector_data": vector_data,
-                    "scale_data": None,
-                    "error": scale_response.text,
-                    "vision_data": vision_data if vision_data else None
+                    "vision_data": converted_vision,
+                    "filter_error": filter_response.text,
+                    "timestamp": "2025-07-22"
                 }
             
-            scale_data = scale_response.json()
-            logger.info("Scale API response parsed successfully")
+            # Parse Pre-Filter API response
+            try:
+                filtered_data = filter_response.json()
+                logger.info("Pre-Filter API response parsed successfully")
+            except Exception as e:
+                logger.error(f"Error parsing Pre-Filter API response: {e}")
+                return {
+                    "status": "partial_success", 
+                    "message": "Vector extraction successful, but pre-filter response parsing failed",
+                    "vector_data": vector_data,
+                    "vision_data": converted_vision,
+                    "filter_error": f"Error parsing Pre-Filter API response: {str(e)}",
+                    "timestamp": "2025-07-22"
+                }
             
+            # Return successful results
             return {
-                "vector_data": vector_data,
-                "scale_data": scale_data,
-                "timestamp": "2025-07-18",
-                "vision_data": vision_data if vision_data else None,
-                "normalized_vision": normalized_vision if normalized_vision else None
+                "status": "success",
+                "message": "PDF processed successfully through both Vector Drawing API and Pre-Filter API",
+                "vector_data": vector_data,  # Keep for backward compatibility
+                "scale_data": filtered_data,  # Keep for backward compatibility  
+                "data": filtered_data,  # New format
+                "vision_data": converted_vision,
+                "processing_stats": {
+                    "original_texts": vector_data.get('summary', {}).get('total_texts', 0),
+                    "original_vectors": (
+                        vector_data.get('summary', {}).get('total_lines', 0) +
+                        vector_data.get('summary', {}).get('total_rectangles', 0) +
+                        vector_data.get('summary', {}).get('total_curves', 0) +
+                        vector_data.get('summary', {}).get('total_polygons', 0)
+                    ),
+                    "regions_processed": len(converted_vision.get("regions", [])) if converted_vision else 0,
+                    "coordinate_conversion": "applied" if converted_vision else "not_applicable"
+                },
+                "timestamp": "2025-07-22"
             }
             
         except Exception as e:
-            logger.error(f"Error calling Scale API: {e}")
+            logger.error(f"Error calling Pre-Filter API: {e}")
             return {
+                "status": "partial_success",
+                "message": "Vector extraction successful, but pre-filtering failed", 
                 "vector_data": vector_data,
-                "scale_data": None,
-                "error": f"Error calling Scale API: {str(e)}",
-                "vision_data": vision_data if vision_data else None
+                "vision_data": converted_vision,
+                "error": f"Error calling Pre-Filter API: {str(e)}",
+                "timestamp": "2025-07-22"
             }
     
     except HTTPException:
@@ -235,7 +271,35 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
 
 @app.get("/health/")
 async def health():
-    return {"status": "healthy", "version": "1.0.1"}
+    return {
+        "status": "healthy", 
+        "version": "1.1.0",
+        "features": [
+            "Vision output integration",
+            "Coordinate conversion (pixels to PDF points)", 
+            "Pre-Filter API integration",
+            "Raw vector data passthrough"
+        ]
+    }
+
+@app.get("/")
+async def root():
+    return {
+        "title": "Enhanced Master API",
+        "version": "1.1.0", 
+        "description": "Processes PDF with vision output integration for Pre-Filter API",
+        "workflow": [
+            "1. Parse vision output (image pixel coordinates)",
+            "2. Call Vector Drawing API (minify=true)", 
+            "3. Convert vision coordinates to PDF points",
+            "4. Send vision_output + raw vector_output to Pre-Filter API",
+            "5. Return combined results"
+        ],
+        "apis_used": {
+            "vector_drawing": VECTOR_API_URL,
+            "pre_filter": PRE_FILTER_API_URL
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn
