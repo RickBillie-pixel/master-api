@@ -97,6 +97,10 @@ async def process_pdf(file: UploadFile = File(...), vision_output: str = Form(No
 
         # Step 1: Call Vector Drawing API with the binary file
         file_content = await file.read()
+        
+        # Reset file pointer for potential re-reading
+        await file.seek(0)
+        
         files = {'file': (file.filename, file_content, 'application/pdf')}
         params = {
             'minify': 'true',
@@ -105,7 +109,17 @@ async def process_pdf(file: UploadFile = File(...), vision_output: str = Form(No
         }
         
         logger.info("Calling Vector Drawing API")
-        vector_response = requests.post(VECTOR_API_URL, files=files, params=params, timeout=300)
+        try:
+            vector_response = requests.post(
+                VECTOR_API_URL, 
+                files=files, 
+                params=params, 
+                timeout=300,
+                headers={'Connection': 'close'}
+            )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Vector Drawing API request failed: {e}")
+            raise HTTPException(status_code=503, detail=f"Vector Drawing API unavailable: {str(e)}")
         
         if vector_response.status_code != 200:
             raise HTTPException(
@@ -160,13 +174,22 @@ async def process_pdf(file: UploadFile = File(...), vision_output: str = Form(No
                     }
                     
                     logger.info("Calling Pre-Filter API with combined data")
-                    headers = {'Content-Type': 'application/json'}
-                    filter_response = requests.post(
-                        PRE_FILTER_API_URL,
-                        json=combined_data,
-                        headers=headers,
-                        timeout=300
-                    )
+                    headers = {'Content-Type': 'application/json', 'Connection': 'close'}
+                    try:
+                        filter_response = requests.post(
+                            PRE_FILTER_API_URL,
+                            json=combined_data,
+                            headers=headers,
+                            timeout=300
+                        )
+                    except requests.exceptions.RequestException as e:
+                        logger.error(f"Pre-Filter API request failed: {e}")
+                        return {
+                            "status": "partial_success",
+                            "message": "Vector extraction successful, but pre-filtering failed",
+                            "data": vector_data,
+                            "filter_error": f"Connection error: {str(e)}"
+                        }
                     
                     if filter_response.status_code != 200:
                         logger.error(f"Pre-Filter API error: {filter_response.status_code} - {filter_response.text}")
@@ -224,7 +247,20 @@ async def process_pdf(file: UploadFile = File(...), vision_output: str = Form(No
             with open(temp_file_path, 'rb') as f:
                 scale_files = {'file': (os.path.basename(temp_file_path), f, 'application/json')}
                 logger.info("Calling Scale API")
-                scale_response = requests.post("https://scale-api-69gl.onrender.com/extract-scale/", files=scale_files, timeout=300)
+                try:
+                    scale_response = requests.post(
+                        "https://scale-api-69gl.onrender.com/extract-scale/", 
+                        files=scale_files, 
+                        timeout=300,
+                        headers={'Connection': 'close'}
+                    )
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Scale API request failed: {e}")
+                    return {
+                        "vector_data": vector_data,
+                        "scale_data": None,
+                        "error": f"Scale API connection error: {str(e)}"
+                    }
             
             os.unlink(temp_file_path)
             
