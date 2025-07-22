@@ -7,6 +7,8 @@ import logging
 import requests
 import json
 from typing import Dict, Any, Optional
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -17,7 +19,7 @@ PORT = int(os.environ.get("PORT", 10000))
 app = FastAPI(
     title="Master API",
     description="Processes PDF by calling Vector Drawing API and Pre-Filter/Scale API with optional Vision output",
-    version="1.2.2"
+    version="1.2.3"
 )
 
 # CORS middleware
@@ -29,15 +31,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-VECTOR_API_URL = "https://vector-drawing.onrender.com/extract/"  # Corrected URL
-PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/pre-scale"  # Optional API
+VECTOR_API_URL = "https://vector-drawing.onrender.com/extract/"
+PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/pre-scale"
 
 def normalize_vision_coordinates(vector_data: Dict, vision_output: Dict) -> Dict:
     """Normalize vision output pixel coordinates to PDF points using page size and image metadata."""
     if not vision_output or "regions" not in vision_output or "image_metadata" not in vision_output:
         return None
 
-    # Extract page dimensions from the first page of vector data
     if not vector_data.get("pages") or not vector_data["pages"]:
         logger.warning("No pages found in vector data, skipping normalization")
         return None
@@ -45,18 +46,15 @@ def normalize_vision_coordinates(vector_data: Dict, vision_output: Dict) -> Dict
     page_width_points = page_metadata.get("page_size", {}).get("width", 3370.0)
     page_height_points = page_metadata.get("page_size", {}).get("height", 2384.0)
 
-    # Extract image metadata from vision output
     image_metadata = vision_output["image_metadata"]
     image_width_pixels = image_metadata.get("image_width_pixels", 9969)
     image_height_pixels = image_metadata.get("image_height_pixels", 7052)
     image_dpi_x = image_metadata.get("image_dpi_x", 213.0044)
     image_dpi_y = image_metadata.get("image_dpi_y", 213.0044)
 
-    # Calculate scale factors based on actual dimensions
     scale_x = page_width_points / image_width_pixels if image_width_pixels > 0 else 1.0
     scale_y = page_height_points / image_height_pixels if image_height_pixels > 0 else 1.0
 
-    # Normalize each region's coordinates to PDF points, adjusting for origin
     normalized_regions = []
     for region in vision_output["regions"]:
         coords = region["coordinate_block"]
@@ -69,7 +67,6 @@ def normalize_vision_coordinates(vector_data: Dict, vision_output: Dict) -> Dict
         x1_points = coords[2] * scale_x
         y1_points = page_height_points - (coords[3] * scale_y)
 
-        # Clamp coordinates to page boundaries
         x0_points = max(0, min(x0_points, page_width_points))
         x1_points = max(0, min(x1_points, page_width_points))
         y0_points = max(0, min(y0_points, page_height_points))
@@ -87,6 +84,28 @@ def normalize_vision_coordinates(vector_data: Dict, vision_output: Dict) -> Dict
         "image_metadata": image_metadata
     }
 
+def make_request_with_retry(url: str, files: dict, params: dict, timeout: int = 30):
+    """Make a request with retry logic for network issues."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+
+    try:
+        response = session.post(url, files=files, params=params, timeout=timeout, headers={'Connection': 'close'})
+        response.raise_for_status()
+        return response
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request to {url} failed: {e}")
+        raise
+    finally:
+        session.close()
+
 @app.post("/process/")
 async def process_pdf(file: UploadFile = File(...), vision_output: str = Form(None)):
     """Process PDF: Extract vectors via Vector Drawing API, optionally normalize vision output, and send to Pre-Filter API or Scale API"""
@@ -95,12 +114,12 @@ async def process_pdf(file: UploadFile = File(...), vision_output: str = Form(No
         logger.info(f"Received file: {file.filename}")
         logger.info(f"Received vision_output: {vision_output[:500] if vision_output else 'None'}...")
 
-        # Step 1: Call Vector Drawing API with the binary file
+        # Read file content and validate
         file_content = await file.read()
-        
-        # Reset file pointer for potential re-reading
-        await file.seek(0)
-        
+        if not file_content:
+            raise HTTPException(status_code=400, detail="Empty file content received")
+        await file.seek(0)  # Reset file pointer
+
         files = {'file': (file.filename, file_content, 'application/pdf')}
         params = {
             'minify': 'true',
@@ -108,25 +127,9 @@ async def process_pdf(file: UploadFile = File(...), vision_output: str = Form(No
             'precision': '2'
         }
         
-        logger.info("Calling Vector Drawing API")
-        try:
-            vector_response = requests.post(
-                VECTOR_API_URL, 
-                files=files, 
-                params=params, 
-                timeout=300,
-                headers={'Connection': 'close'}
-            )
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Vector Drawing API request failed: {e}")
-            raise HTTPException(status_code=503, detail=f"Vector Drawing API unavailable: {str(e)}")
-        
-        if vector_response.status_code != 200:
-            raise HTTPException(
-                status_code=vector_response.status_code,
-                detail=f"Vector Drawing API error: {vector_response.text}"
-            )
-        
+        logger.info("Calling Vector Drawing API with retry")
+        vector_response = make_request_with_retry(VECTOR_API_URL, files, params)
+
         # Parse Vector Drawing API response
         raw_response = vector_response.text
         logger.info(f"Vector Drawing API response length: {len(raw_response)} bytes")
@@ -141,13 +144,10 @@ async def process_pdf(file: UploadFile = File(...), vision_output: str = Form(No
             logger.error(f"JSON parsing error: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to parse Vector Drawing API response: {str(e)}")
         
-        # Validate structure
         if not isinstance(vector_data, dict) or 'pages' not in vector_data or not vector_data["pages"]:
             raise HTTPException(status_code=400, detail="Vector Drawing API response missing required fields or pages")
 
-        # Determine processing path based on vision_output
         if vision_output:
-            # New path: Parse vision_output and normalize coordinates
             try:
                 vision_output_data = json.loads(vision_output)
                 if isinstance(vision_output_data, list) and vision_output_data:
@@ -160,7 +160,6 @@ async def process_pdf(file: UploadFile = File(...), vision_output: str = Form(No
                 
                 normalized_vision_output = normalize_vision_coordinates(vector_data, vision_output_dict) if vision_output_dict else None
                 
-                # Send to Pre-Filter API if vision_output is valid
                 if normalized_vision_output:
                     combined_data = {
                         "pages": vector_data["pages"],
@@ -174,14 +173,8 @@ async def process_pdf(file: UploadFile = File(...), vision_output: str = Form(No
                     }
                     
                     logger.info("Calling Pre-Filter API with combined data")
-                    headers = {'Content-Type': 'application/json', 'Connection': 'close'}
                     try:
-                        filter_response = requests.post(
-                            PRE_FILTER_API_URL,
-                            json=combined_data,
-                            headers=headers,
-                            timeout=300
-                        )
+                        filter_response = make_request_with_retry(PRE_FILTER_API_URL, data=combined_data, headers={'Content-Type': 'application/json', 'Connection': 'close'})
                     except requests.exceptions.RequestException as e:
                         logger.error(f"Pre-Filter API request failed: {e}")
                         return {
@@ -210,7 +203,6 @@ async def process_pdf(file: UploadFile = File(...), vision_output: str = Form(No
                 logger.error(f"Error processing vision_output: {e}")
                 raise HTTPException(status_code=500, detail=f"Error processing vision_output: {str(e)}")
 
-        # Old path: Fall back to Scale API processing if no vision_output or invalid
         logger.info("Falling back to Scale API processing")
         drawings = vector_data["pages"][0].get("drawings", {})
         texts = vector_data["pages"][0].get("texts", [])
@@ -248,12 +240,7 @@ async def process_pdf(file: UploadFile = File(...), vision_output: str = Form(No
                 scale_files = {'file': (os.path.basename(temp_file_path), f, 'application/json')}
                 logger.info("Calling Scale API")
                 try:
-                    scale_response = requests.post(
-                        "https://scale-api-69gl.onrender.com/extract-scale/", 
-                        files=scale_files, 
-                        timeout=300,
-                        headers={'Connection': 'close'}
-                    )
+                    scale_response = make_request_with_retry("https://scale-api-69gl.onrender.com/extract-scale/", files=scale_files)
                 except requests.exceptions.RequestException as e:
                     logger.error(f"Scale API request failed: {e}")
                     return {
@@ -294,7 +281,7 @@ async def process_pdf(file: UploadFile = File(...), vision_output: str = Form(No
 
 @app.get("/health/")
 async def health():
-    return {"status": "healthy", "version": "1.2.2"}
+    return {"status": "healthy", "version": "1.2.3"}
 
 @app.get("/")
 async def root():
