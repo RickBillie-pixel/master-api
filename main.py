@@ -30,7 +30,7 @@ app.add_middleware(
 )
 
 # API URLs
-VECTOR_API_URL = "https://vector-drawing.onrender.com/extract/"
+VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
 PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/pre-scale"
 
 def convert_vision_coordinates_to_pdf(vision_data: Dict, pdf_page_size: Dict) -> Dict:
