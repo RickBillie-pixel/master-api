@@ -45,6 +45,16 @@ def convert_pixel_to_pdf_coordinates(vision_output: Dict[str, Any], pdf_width: f
         Updated vision output with PDF coordinates
     """
     try:
+        # Ensure vision_output is a dictionary
+        if not isinstance(vision_output, dict):
+            logger.error(f"Vision output is not a dictionary: {type(vision_output)}")
+            return {
+                "coordinate_conversion": {
+                    "conversion_applied": False,
+                    "error": f"Vision output is not a dictionary but {type(vision_output)}"
+                }
+            }
+        
         # Get image dimensions from vision output
         image_metadata = vision_output.get("image_metadata", {})
         image_width = image_metadata.get("image_width_pixels", 0)
@@ -108,13 +118,13 @@ def convert_pixel_to_pdf_coordinates(vision_output: Dict[str, Any], pdf_width: f
         
     except Exception as e:
         logger.error(f"Error converting coordinates: {e}")
-        # Return original if conversion fails
-        vision_output_copy = vision_output.copy()
-        vision_output_copy["coordinate_conversion"] = {
-            "conversion_applied": False,
-            "error": str(e)
+        # Return safe fallback
+        return {
+            "coordinate_conversion": {
+                "conversion_applied": False,
+                "error": str(e)
+            }
         }
-        return vision_output_copy
 
 @app.post("/process/")
 async def process_pdf(file: UploadFile, vision_output: str = Form(...)):
@@ -125,14 +135,32 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(...)):
     try:
         logger.info(f"Received file: {file.filename}")
         
-        # Step 1: Parse vision_output
+        # Step 1: Parse vision_output (handle potential double encoding)
         try:
+            logger.info(f"Raw vision_output type: {type(vision_output)}")
+            logger.info(f"Raw vision_output preview: {str(vision_output)[:200]}...")
+            
             vision_output_dict = json.loads(vision_output)
+            
+            # Check if it's still a string (double encoded)
+            if isinstance(vision_output_dict, str):
+                logger.info("Vision output is double-encoded, parsing again")
+                vision_output_dict = json.loads(vision_output_dict)
+            
             logger.info("Vision output parsed successfully")
-            logger.info(f"Vision output contains {len(vision_output_dict.get('regions', []))} regions")
+            logger.info(f"Vision output type after parsing: {type(vision_output_dict)}")
+            
+            if isinstance(vision_output_dict, dict):
+                logger.info(f"Vision output contains {len(vision_output_dict.get('regions', []))} regions")
+            else:
+                logger.warning(f"Vision output is not a dict: {type(vision_output_dict)}")
+                
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing error for vision_output: {e}")
             raise HTTPException(status_code=400, detail=f"Invalid vision_output JSON: {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error parsing vision_output: {e}")
+            raise HTTPException(status_code=400, detail=f"Error processing vision_output: {str(e)}")
         
         # Step 2: Call Vector Drawing API
         file_content = await file.read()
@@ -196,7 +224,16 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(...)):
         
         # Step 4: Convert vision output coordinates to PDF coordinates
         logger.info("Converting vision output coordinates to PDF coordinates")
-        converted_vision_output = convert_pixel_to_pdf_coordinates(vision_output_dict, pdf_width, pdf_height)
+        if isinstance(vision_output_dict, dict):
+            converted_vision_output = convert_pixel_to_pdf_coordinates(vision_output_dict, pdf_width, pdf_height)
+        else:
+            logger.error(f"Cannot convert coordinates: vision_output_dict is {type(vision_output_dict)}")
+            converted_vision_output = {
+                "coordinate_conversion": {
+                    "conversion_applied": False,
+                    "error": f"Vision output is not a dictionary but {type(vision_output_dict)}"
+                }
+            }
         
         # Step 5: Combine data with converted coordinates
         combined_data = {
