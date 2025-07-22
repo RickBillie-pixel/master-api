@@ -1,7 +1,7 @@
 import os
 import tempfile
 import uuid
-from fastapi import FastAPI, UploadFile, HTTPException, Form
+from fastapi import FastAPI, UploadFile, HTTPException, Form, File
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import requests
