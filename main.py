@@ -42,7 +42,7 @@ async def process_pdf(file: UploadFile):
         file_content = await file.read()
         files = {'file': (file.filename, file_content, 'application/pdf')}
         params = {
-            'minify': 'false',  # Use non-minified output
+            'minify': 'true',  # Use non-minified output
             'remove_non_essential': 'false',
             'precision': '2'
         }
