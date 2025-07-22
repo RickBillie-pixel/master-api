@@ -17,7 +17,7 @@ PORT = int(os.environ.get("PORT", 10000))
 app = FastAPI(
     title="Master API",
     description="Processes PDF by calling Vector Drawing API and Scale API, with optional vision output",
-    version="1.0.0"
+    version="1.0.1"
 )
 
 # CORS middleware
@@ -29,21 +29,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
+VECTOR_API_URL = "https://vector-drawing.onrender.com/extract/"  # Corrected URL
 SCALE_API_URL = "https://scale-api-69gl.onrender.com/extract-scale/"
+
+def normalize_vision_coordinates(vector_data: Dict, vision_output: Dict) -> Dict:
+    """Normalize vision output pixel coordinates to PDF points using page size and image metadata."""
+    if not vision_output or "regions" not in vision_output or "image_metadata" not in vision_output:
+        return None
+
+    if not vector_data.get("pages") or not vector_data["pages"]:
+        logger.warning("No pages found in vector data, skipping normalization")
+        return None
+    page_metadata = vector_data["pages"][0]
+    page_width_points = page_metadata.get("page_size", {}).get("width", 3370.0)
+    page_height_points = page_metadata.get("page_size", {}).get("height", 2384.0)
+
+    image_metadata = vision_output["image_metadata"]
+    image_width_pixels = image_metadata.get("image_width_pixels", 9969)
+    image_height_pixels = image_metadata.get("image_height_pixels", 7052)
+
+    scale_x = page_width_points / image_width_pixels if image_width_pixels > 0 else 1.0
+    scale_y = page_height_points / image_height_pixels if image_height_pixels > 0 else 1.0
+
+    normalized_regions = []
+    for region in vision_output["regions"]:
+        coords = region["coordinate_block"]
+        if len(coords) != 4 or any(c < 0 for c in coords):
+            logger.warning(f"Invalid coordinates for region {region['label']}, skipping")
+            continue
+
+        x0_points = coords[0] * scale_x
+        y0_points = page_height_points - (coords[1] * scale_y)
+        x1_points = coords[2] * scale_x
+        y1_points = page_height_points - (coords[3] * scale_y)
+
+        x0_points = max(0, min(x0_points, page_width_points))
+        x1_points = max(0, min(x1_points, page_width_points))
+        y0_points = max(0, min(y0_points, page_height_points))
+        y1_points = max(0, min(y1_points, page_height_points))
+
+        normalized_regions.append({
+            "coordinate_block": [x0_points, y0_points, x1_points, y1_points],
+            "label": region["label"]
+        })
+
+    return {
+        "drawing_type": vision_output["drawing_type"],
+        "scale_api_version": vision_output["scale_api_version"],
+        "regions": normalized_regions,
+        "image_metadata": image_metadata
+    }
 
 @app.post("/process/")
 async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
-    """Process PDF: Extract vectors via Vector Drawing API, save to JSON, then calculate scale via Scale API"""
+    """Process PDF: Extract vectors via Vector Drawing API, optionally normalize vision output, and send to Scale API"""
     try:
         logger.info(f"Received file: {file.filename}")
         
         # Optional vision_output handling
         vision_data = None
+        normalized_vision = None
         if vision_output:
             try:
                 vision_data = json.loads(vision_output)
                 logger.info("Vision output parsed successfully")
+                normalized_vision = normalize_vision_coordinates({"pages": [{"page_size": {"width": 3370.0, "height": 2384.0}}]}, vision_data)
+                if normalized_vision:
+                    logger.info("Vision coordinates normalized successfully")
             except json.JSONDecodeError as e:
                 logger.error(f"JSON parsing error for vision_output: {e}")
                 raise HTTPException(status_code=400, detail=f"Invalid vision_output JSON: {str(e)}")
@@ -52,7 +104,7 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
         file_content = await file.read()
         files = {'file': (file.filename, file_content, 'application/pdf')}
         params = {
-            'minify': 'true',  # Use non-minified output
+            'minify': 'false',
             'remove_non_essential': 'false',
             'precision': '2'
         }
@@ -73,12 +125,10 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
         
         # Don't use requests.json() - explicitly parse the JSON string
         try:
-            # Use standard json module to parse
             vector_data = json.loads(raw_response)
             logger.info(f"JSON parsed successfully, type={type(vector_data)}")
             logger.info(f"Top-level keys: {list(vector_data.keys()) if isinstance(vector_data, dict) else 'Not a dict'}")
             
-            # Double-check if we need to parse again (in case of double-encoding)
             if isinstance(vector_data, str):
                 logger.warning("Parsed result is still a string, attempting to parse again")
                 vector_data = json.loads(vector_data)
@@ -86,14 +136,12 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
                 logger.info(f"Second parse keys: {list(vector_data.keys()) if isinstance(vector_data, dict) else 'Not a dict'}")
         except Exception as e:
             logger.error(f"JSON parsing error: {e}")
-            # Save problematic response for debugging
             debug_path = f"/tmp/vector_response_{uuid.uuid4()}.json"
             with open(debug_path, 'w') as f:
                 f.write(raw_response)
             logger.info(f"Saved problematic response to {debug_path}")
             raise HTTPException(status_code=500, detail=f"Failed to parse Vector Drawing API response: {str(e)}")
         
-        # Ensure we have the expected structure
         if not isinstance(vector_data, dict):
             raise HTTPException(status_code=400, detail="Parsed result is not a dictionary")
             
@@ -115,7 +163,6 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
             "texts": []
         }
         
-        # Process lines from drawings
         if 'lines' in drawings and isinstance(drawings['lines'], list):
             for line in drawings['lines']:
                 if 'p1' in line and 'p2' in line:
@@ -126,7 +173,6 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
                         "length": line.get("length")
                     })
         
-        # Process texts
         for text in texts:
             if 'text' in text and 'position' in text:
                 vector_data_for_scale["texts"].append({
@@ -150,7 +196,6 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
                 logger.info("Calling Scale API")
                 scale_response = requests.post(SCALE_API_URL, files=scale_files, timeout=300)
             
-            # Clean up temp file
             os.unlink(temp_file_path)
             
             if scale_response.status_code != 200:
@@ -158,26 +203,19 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
                 return {
                     "vector_data": vector_data,
                     "scale_data": None,
-                    "error": scale_response.text
+                    "error": scale_response.text,
+                    "vision_data": vision_data if vision_data else None
                 }
             
-            # Parse Scale API response
-            try:
-                scale_data = scale_response.json()
-                logger.info("Scale API response parsed successfully")
-            except Exception as e:
-                logger.error(f"Error parsing Scale API response: {e}")
-                return {
-                    "vector_data": vector_data,
-                    "scale_data": None,
-                    "error": f"Error parsing Scale API response: {str(e)}"
-                }
+            scale_data = scale_response.json()
+            logger.info("Scale API response parsed successfully")
             
-            # Return combined results
             return {
                 "vector_data": vector_data,
                 "scale_data": scale_data,
-                "timestamp": "2025-07-18"
+                "timestamp": "2025-07-18",
+                "vision_data": vision_data if vision_data else None,
+                "normalized_vision": normalized_vision if normalized_vision else None
             }
             
         except Exception as e:
@@ -185,7 +223,8 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
             return {
                 "vector_data": vector_data,
                 "scale_data": None,
-                "error": f"Error calling Scale API: {str(e)}"
+                "error": f"Error calling Scale API: {str(e)}",
+                "vision_data": vision_data if vision_data else None
             }
     
     except HTTPException:
@@ -196,7 +235,7 @@ async def process_pdf(file: UploadFile, vision_output: str = Form(None)):
 
 @app.get("/health/")
 async def health():
-    return {"status": "healthy", "version": "1.0.0"}
+    return {"status": "healthy", "version": "1.0.1"}
 
 if __name__ == "__main__":
     import uvicorn
