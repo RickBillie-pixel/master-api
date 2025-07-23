@@ -231,12 +231,13 @@ def convert_vector_data_to_filter_format(vector_data: Dict) -> Dict:
 async def process_pdf_clean(
     file: UploadFile = File(...),
     vision_output: str = Form(...),
-    output_format: str = Form(default="json")
+    output_format: str = Form(default="json"),
+    debug: bool = Form(default=False)
 ):
     """Process PDF and return clean, focused output per region"""
     try:
         logger.info(f"=== Starting Clean PDF Processing v3.0.0 ===")
-        logger.info(f"File: {file.filename}")
+        logger.info(f"File: {file.filename}, Debug: {debug}")
         
         # Read file
         file_content = await file.read()
@@ -289,6 +290,268 @@ async def process_pdf_clean(
         filter_request = {
             "vector_data": filter_vector_data,
             "vision_output": converted_vision
+        }
+
+        # Call Clean Filter API with debug if requested
+        logger.info("=== Calling Clean Filter API ===")
+        
+        try:
+            if debug:
+                # First call debug endpoint
+                debug_response = requests.post(
+                    FILTER_API_URL.replace('/filter/', '/debug/'),
+                    json=filter_request,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=300
+                )
+                
+                if debug_response.status_code == 200:
+                    debug_data = debug_response.json()
+                    logger.info("=== DEBUG INFO ===")
+                    logger.info(f"Total lines: {debug_data.get('total_lines')}")
+                    logger.info(f"Coordinate range: {debug_data.get('coordinate_analysis')}")
+                    for region_debug in debug_data.get('regions', []):
+                        logger.info(f"Region {region_debug['label']}: {region_debug['lines_in_region']} lines in region, {region_debug['lines_included']} included")
+                else:
+                    logger.warning("Debug endpoint failed")
+            
+            # Main filter call with debug parameter
+            filter_url = f"{FILTER_API_URL}?debug={str(debug).lower()}"
+            filter_response = requests.post(
+                filter_url,
+                json=filter_request,
+                headers={'Content-Type': 'application/json'},
+                timeout=300
+            )
+            
+            if filter_response.status_code != 200:
+                logger.error(f"Filter API error: {filter_response.text}")
+                raise HTTPException(status_code=500, detail="Filter API failed")
+            
+            filtered_data = filter_response.json()
+            logger.info("✅ Clean filtering successful")
+            
+            # Create final result
+            result = {
+                "status": "success",
+                "data": filtered_data,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            if debug:
+                result["debug_info"] = debug_data if 'debug_data' in locals() else None
+            
+            # Log summary
+            total_lines = sum(len(r.get('lines', [])) for r in filtered_data.get('regions', []))
+            total_texts = sum(len(r.get('texts', [])) for r in filtered_data.get('regions', []))
+            
+            logger.info(f"✅ Final result:")
+            logger.info(f"  Drawing type: {filtered_data.get('drawing_type')}")
+            logger.info(f"  Regions: {len(filtered_data.get('regions', []))}")
+            logger.info(f"  Total lines: {total_lines}")
+            logger.info(f"  Total texts: {total_texts}")
+            
+            if total_lines == 0:
+                logger.warning("⚠️  WARNING: No lines in output! Check coordinate conversion or filtering logic.")
+            
+            # Return appropriate format
+            if output_format == "txt":
+                summary = f"""=== CLEAN PDF PROCESSING RESULT ===
+Status: {result['status']}
+Drawing Type: {filtered_data.get('drawing_type')}
+Regions: {len(filtered_data.get('regions', []))}
+Total Lines: {total_lines}
+Total Texts: {total_texts}
+Timestamp: {result['timestamp']}
+
+REGIONS:
+"""
+                for region in filtered_data.get('regions', []):
+                    summary += f"- {region.get('label')}: {len(region.get('lines', []))} lines, {len(region.get('texts', []))} texts\n"
+                
+                if total_lines == 0:
+                    summary += "\n⚠️  WARNING: No lines found! Check coordinate system or filtering logic.\n"
+                
+                return PlainTextResponse(content=summary)
+            else:
+                return result
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Filter API request failed: {e}")
+            raise HTTPException(status_code=500, detail="Filter API connection failed")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/debug/")
+async def debug_pdf_processing(
+    file: UploadFile = File(...),
+    vision_output: str = Form(...)
+):
+    """Debug endpoint to diagnose processing issues"""
+    try:
+        logger.info("=== Debug PDF Processing ===")
+        
+        # Read file
+        file_content = await file.read()
+        file_size_mb = len(file_content) / (1024 * 1024)
+        
+        # Parse vision output
+        vision_data = json.loads(vision_output)
+        
+        # Call Vector API
+        params = {'minify': 'true', 'precision': '1'}
+        vector_response = await call_vector_api_with_retry(file_content, file.filename, params)
+        vector_data = json.loads(vector_response.text)
+        
+        # Convert coordinates
+        first_page = vector_data['pages'][0]
+        pdf_page_size = first_page.get('page_size', {"width": 595.0, "height": 842.0})
+        converted_vision = convert_vision_coordinates_to_pdf(vision_data, pdf_page_size)
+        
+        # Convert vector data
+        filter_vector_data = convert_vector_data_to_filter_format(vector_data)
+        
+        # Call debug endpoint
+        filter_request = {
+            "vector_data": filter_vector_data,
+            "vision_output": converted_vision
+        }
+        
+        debug_response = requests.post(
+            FILTER_API_URL.replace('/filter/', '/debug/'),
+            json=filter_request,
+            headers={'Content-Type': 'application/json'},
+            timeout=300
+        )
+        
+        debug_data = debug_response.json() if debug_response.status_code == 200 else {"error": debug_response.text}
+        
+        return {
+            "file_info": {
+                "filename": file.filename,
+                "size_mb": round(file_size_mb, 2)
+            },
+            "pdf_page_size": pdf_page_size,
+            "vision_regions": len(vision_data.get('regions', [])),
+            "converted_regions": [
+                {
+                    "label": r.get('label'),
+                    "original_bounds": vision_data['regions'][i]['coordinate_block'],
+                    "converted_bounds": r.get('coordinate_block')
+                }
+                for i, r in enumerate(converted_vision.get('regions', []))
+            ],
+            "vector_data_info": {
+                "total_lines": len(filter_vector_data['pages'][0]['lines']),
+                "total_texts": len(filter_vector_data['pages'][0]['texts'])
+            },
+            "filter_debug": debug_data
+        }
+        
+    except Exception as e:
+        logger.error(f"Debug error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
+vision
+        }
+
+        # Call Clean Filter API with debug if requested
+        logger.info("=== Calling Clean Filter API ===")
+        
+        try:
+            if debug:
+                # First call debug endpoint
+                debug_response = requests.post(
+                    FILTER_API_URL.replace('/filter/', '/debug/'),
+                    json=filter_request,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=300
+                )
+                
+                if debug_response.status_code == 200:
+                    debug_data = debug_response.json()
+                    logger.info("=== DEBUG INFO ===")
+                    logger.info(f"Total lines: {debug_data.get('total_lines')}")
+                    logger.info(f"Coordinate range: {debug_data.get('coordinate_analysis')}")
+                    for region_debug in debug_data.get('regions', []):
+                        logger.info(f"Region {region_debug['label']}: {region_debug['lines_in_region']} lines in region, {region_debug['lines_included']} included")
+                else:
+                    logger.warning("Debug endpoint failed")
+            
+            # Main filter call with debug parameter
+            filter_url = f"{FILTER_API_URL}?debug={str(debug).lower()}"
+            filter_response = requests.post(
+                filter_url,
+                json=filter_request,
+                headers={'Content-Type': 'application/json'},
+                timeout=300
+            )
+            
+            if filter_response.status_code != 200:
+                logger.error(f"Filter API error: {filter_response.text}")
+                raise HTTPException(status_code=500, detail="Filter API failed")
+            
+            filtered_data = filter_response.json()
+            logger.info("✅ Clean filtering successful")
+            
+            # Create final result
+            result = {
+                "status": "success",
+                "data": filtered_data,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            if debug:
+                result["debug_info"] = debug_data if 'debug_data' in locals() else None
+            
+            # Log summary
+            total_lines = sum(len(r.get('lines', [])) for r in filtered_data.get('regions', []))
+            total_texts = sum(len(r.get('texts', [])) for r in filtered_data.get('regions', []))
+            
+            logger.info(f"✅ Final result:")
+            logger.info(f"  Drawing type: {filtered_data.get('drawing_type')}")
+            logger.info(f"  Regions: {len(filtered_data.get('regions', []))}")
+            logger.info(f"  Total lines: {total_lines}")
+            logger.info(f"  Total texts: {total_texts}")
+            
+            if total_lines == 0:
+                logger.warning("⚠️  WARNING: No lines in output! Check coordinate conversion or filtering logic.")
+            
+            # Return appropriate format
+            if output_format == "txt":
+                summary = f"""=== CLEAN PDF PROCESSING RESULT ===
+Status: {result['status']}
+Drawing Type: {filtered_data.get('drawing_type')}
+Regions: {len(filtered_data.get('regions', []))}
+Total Lines: {total_lines}
+Total Texts: {total_texts}
+Timestamp: {result['timestamp']}
+
+REGIONS:
+"""
+                for region in filtered_data.get('regions', []):
+                    summary += f"- {region.get('label')}: {len(region.get('lines', []))} lines, {len(region.get('texts', []))} texts\n"
+                
+                if total_lines == 0:
+                    summary += "\n⚠️  WARNING: No lines found! Check coordinate system or filtering logic.\n"
+                
+                return PlainTextResponse(content=summary)
+            else:
+                return result
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Filter API request failed: {e}")
+            raise HTTPException(status_code=500, detail="Filter API connection failed")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+vision
         }
 
         # Call Clean Filter API
@@ -380,12 +643,18 @@ async def root():
         ],
         "key_improvements": [
             "No unassigned data",
-            "No unnecessary metadata",
+            "No unnecessary metadata", 
             "Clean per-region structure",
             "Precise line data with midpoints",
             "Text with bounding boxes preserved",
-            "Plattegrond includes ALL lines"
+            "Plattegrond includes ALL lines",
+            "Debug mode for troubleshooting"
         ],
+        "endpoints": {
+            "/process/": "Main processing endpoint",
+            "/debug/": "Debug coordinate conversion and filtering",
+            "/process/?debug=true": "Process with debug logging"
+        },
         "output_structure": {
             "status": "success",
             "data": {
