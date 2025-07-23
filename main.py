@@ -33,7 +33,7 @@ app.add_middleware(
 )
 
 VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
-FILTER_API_URL = "https://your-clean-filter-api.onrender.com/filter/"  # Update this URL
+FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/filter/" 
 
 MAX_RETRIES = 3
 
