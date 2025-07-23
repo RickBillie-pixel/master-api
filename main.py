@@ -296,6 +296,7 @@ async def process_pdf_clean(
         logger.info("=== Calling Clean Filter API ===")
         
         try:
+            debug_data = None
             if debug:
                 # First call debug endpoint
                 debug_response = requests.post(
@@ -338,8 +339,8 @@ async def process_pdf_clean(
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
             
-            if debug:
-                result["debug_info"] = debug_data if 'debug_data' in locals() else None
+            if debug and debug_data:
+                result["debug_info"] = debug_data
             
             # Log summary
             total_lines = sum(len(r.get('lines', [])) for r in filtered_data.get('regions', []))
@@ -455,168 +456,6 @@ async def debug_pdf_processing(
     except Exception as e:
         logger.error(f"Debug error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
-vision
-        }
-
-        # Call Clean Filter API with debug if requested
-        logger.info("=== Calling Clean Filter API ===")
-        
-        try:
-            if debug:
-                # First call debug endpoint
-                debug_response = requests.post(
-                    FILTER_API_URL.replace('/filter/', '/debug/'),
-                    json=filter_request,
-                    headers={'Content-Type': 'application/json'},
-                    timeout=300
-                )
-                
-                if debug_response.status_code == 200:
-                    debug_data = debug_response.json()
-                    logger.info("=== DEBUG INFO ===")
-                    logger.info(f"Total lines: {debug_data.get('total_lines')}")
-                    logger.info(f"Coordinate range: {debug_data.get('coordinate_analysis')}")
-                    for region_debug in debug_data.get('regions', []):
-                        logger.info(f"Region {region_debug['label']}: {region_debug['lines_in_region']} lines in region, {region_debug['lines_included']} included")
-                else:
-                    logger.warning("Debug endpoint failed")
-            
-            # Main filter call with debug parameter
-            filter_url = f"{FILTER_API_URL}?debug={str(debug).lower()}"
-            filter_response = requests.post(
-                filter_url,
-                json=filter_request,
-                headers={'Content-Type': 'application/json'},
-                timeout=300
-            )
-            
-            if filter_response.status_code != 200:
-                logger.error(f"Filter API error: {filter_response.text}")
-                raise HTTPException(status_code=500, detail="Filter API failed")
-            
-            filtered_data = filter_response.json()
-            logger.info("✅ Clean filtering successful")
-            
-            # Create final result
-            result = {
-                "status": "success",
-                "data": filtered_data,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-            
-            if debug:
-                result["debug_info"] = debug_data if 'debug_data' in locals() else None
-            
-            # Log summary
-            total_lines = sum(len(r.get('lines', [])) for r in filtered_data.get('regions', []))
-            total_texts = sum(len(r.get('texts', [])) for r in filtered_data.get('regions', []))
-            
-            logger.info(f"✅ Final result:")
-            logger.info(f"  Drawing type: {filtered_data.get('drawing_type')}")
-            logger.info(f"  Regions: {len(filtered_data.get('regions', []))}")
-            logger.info(f"  Total lines: {total_lines}")
-            logger.info(f"  Total texts: {total_texts}")
-            
-            if total_lines == 0:
-                logger.warning("⚠️  WARNING: No lines in output! Check coordinate conversion or filtering logic.")
-            
-            # Return appropriate format
-            if output_format == "txt":
-                summary = f"""=== CLEAN PDF PROCESSING RESULT ===
-Status: {result['status']}
-Drawing Type: {filtered_data.get('drawing_type')}
-Regions: {len(filtered_data.get('regions', []))}
-Total Lines: {total_lines}
-Total Texts: {total_texts}
-Timestamp: {result['timestamp']}
-
-REGIONS:
-"""
-                for region in filtered_data.get('regions', []):
-                    summary += f"- {region.get('label')}: {len(region.get('lines', []))} lines, {len(region.get('texts', []))} texts\n"
-                
-                if total_lines == 0:
-                    summary += "\n⚠️  WARNING: No lines found! Check coordinate system or filtering logic.\n"
-                
-                return PlainTextResponse(content=summary)
-            else:
-                return result
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Filter API request failed: {e}")
-            raise HTTPException(status_code=500, detail="Filter API connection failed")
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-vision
-        }
-
-        # Call Clean Filter API
-        logger.info("=== Calling Clean Filter API ===")
-        
-        try:
-            filter_response = requests.post(
-                FILTER_API_URL,
-                json=filter_request,
-                headers={'Content-Type': 'application/json'},
-                timeout=300
-            )
-            
-            if filter_response.status_code != 200:
-                logger.error(f"Filter API error: {filter_response.text}")
-                raise HTTPException(status_code=500, detail="Filter API failed")
-            
-            filtered_data = filter_response.json()
-            logger.info("✅ Clean filtering successful")
-            
-            # Create final result
-            result = {
-                "status": "success",
-                "data": filtered_data,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-            
-            # Log summary
-            total_lines = sum(len(r.get('lines', [])) for r in filtered_data.get('regions', []))
-            total_texts = sum(len(r.get('texts', [])) for r in filtered_data.get('regions', []))
-            
-            logger.info(f"✅ Final result:")
-            logger.info(f"  Drawing type: {filtered_data.get('drawing_type')}")
-            logger.info(f"  Regions: {len(filtered_data.get('regions', []))}")
-            logger.info(f"  Total lines: {total_lines}")
-            logger.info(f"  Total texts: {total_texts}")
-            
-            # Return appropriate format
-            if output_format == "txt":
-                summary = f"""=== CLEAN PDF PROCESSING RESULT ===
-Status: {result['status']}
-Drawing Type: {filtered_data.get('drawing_type')}
-Regions: {len(filtered_data.get('regions', []))}
-Total Lines: {total_lines}
-Total Texts: {total_texts}
-Timestamp: {result['timestamp']}
-
-REGIONS:
-"""
-                for region in filtered_data.get('regions', []):
-                    summary += f"- {region.get('label')}: {len(region.get('lines', []))} lines, {len(region.get('texts', []))} texts\n"
-                
-                return PlainTextResponse(content=summary)
-            else:
-                return result
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Filter API request failed: {e}")
-            raise HTTPException(status_code=500, detail="Filter API connection failed")
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/health/")
 async def health():
@@ -647,7 +486,7 @@ async def root():
             "Clean per-region structure",
             "Precise line data with midpoints",
             "Text with bounding boxes preserved",
-            "Plattegrond includes ALL lines",
+            "Correct length filtering per drawing type (plattegrond > 50pt)",
             "Debug mode for troubleshooting"
         ],
         "endpoints": {
