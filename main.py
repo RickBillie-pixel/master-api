@@ -1,6 +1,7 @@
 import os
 import tempfile
 import uuid
+import math
 from fastapi import FastAPI, UploadFile, HTTPException, Form, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
@@ -33,7 +34,7 @@ app.add_middleware(
 )
 
 VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
-FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/filter/" 
+FILTER_API_URL = "https://your-clean-filter-api.onrender.com/filter/"  # Update this URL
 
 MAX_RETRIES = 3
 
@@ -139,36 +140,100 @@ def convert_vision_coordinates_to_pdf(vision_data: Dict, pdf_page_size: Dict) ->
 def convert_vector_data_to_filter_format(vector_data: Dict) -> Dict:
     """Convert Vector API output to Filter API expected format"""
     try:
+        logger.info("=== DEBUG: Vector Data Structure Analysis ===")
+        
         pages = vector_data.get("pages", [])
         if not pages:
             raise ValueError("No pages found in vector data")
         
         page = pages[0]
         page_size = page.get("page_size", {"width": 595.0, "height": 842.0})
-        drawings = page.get("drawings", {})
-        texts = page.get("texts", [])
         
-        # Convert lines
+        # Log the actual structure to understand what we're getting
+        logger.info(f"Page keys: {list(page.keys())}")
+        
+        # Try to find the correct structure
+        texts = []
         lines = []
-        for line in drawings.get("lines", []):
-            try:
-                start = line.get("start", [0.0, 0.0])
-                end = line.get("end", [0.0, 0.0])
+        
+        # Check for texts in multiple possible locations
+        if "texts" in page:
+            texts = page["texts"]
+            logger.info(f"Found {len(texts)} texts in page['texts']")
+        
+        # Check for drawings/lines in multiple possible locations
+        drawings = page.get("drawings", {})
+        if drawings:
+            logger.info(f"Drawings keys: {list(drawings.keys())}")
+            
+            # Check for lines in drawings
+            if "lines" in drawings:
+                raw_lines = drawings["lines"]
+                logger.info(f"Found {len(raw_lines)} lines in drawings['lines']")
                 
-                if len(start) == 2 and len(end) == 2:
-                    converted_line = {
-                        "p1": [float(start[0]), float(start[1])],
-                        "p2": [float(end[0]), float(end[1])],
-                        "stroke_width": float(line.get("stroke_width", 1.0)),
-                        "length": float(line.get("length", 0.0)),
-                        "color": line.get("color", [0, 0, 0]),
-                        "is_dashed": bool(line.get("is_dashed", False)),
-                        "angle": float(line.get("angle")) if line.get("angle") is not None else None
-                    }
-                    lines.append(converted_line)
-            except Exception as e:
-                logger.warning(f"Error converting line: {e}")
-                continue
+                # Log first few lines to see structure
+                for i, line in enumerate(raw_lines[:3]):
+                    logger.info(f"Sample line {i}: {line}")
+                
+                # Convert lines based on actual structure
+                for line in raw_lines:
+                    try:
+                        # Check different possible field names for coordinates
+                        start_point = None
+                        end_point = None
+                        
+                        # Try different field names
+                        if "p1" in line and "p2" in line:
+                            start_point = line["p1"]
+                            end_point = line["p2"]
+                        elif "start" in line and "end" in line:
+                            start_point = line["start"]
+                            end_point = line["end"]
+                        elif "type" in line and line["type"] == "line":
+                            # For your Vector API format
+                            start_point = line.get("p1", [0.0, 0.0])
+                            end_point = line.get("p2", [0.0, 0.0])
+                        
+                        # Convert points to [x, y] format
+                        if start_point and end_point:
+                            # Handle different point formats
+                            if isinstance(start_point, dict):
+                                start = [float(start_point.get("x", 0)), float(start_point.get("y", 0))]
+                            elif isinstance(start_point, list) and len(start_point) >= 2:
+                                start = [float(start_point[0]), float(start_point[1])]
+                            else:
+                                start = [0.0, 0.0]
+                            
+                            if isinstance(end_point, dict):
+                                end = [float(end_point.get("x", 0)), float(end_point.get("y", 0))]
+                            elif isinstance(end_point, list) and len(end_point) >= 2:
+                                end = [float(end_point[0]), float(end_point[1])]
+                            else:
+                                end = [0.0, 0.0]
+                            
+                            # Calculate length if not provided
+                            length = line.get("length", 0.0)
+                            if length == 0.0:
+                                length = math.sqrt((end[0] - start[0])**2 + (end[1] - start[1])**2)
+                            
+                            converted_line = {
+                                "p1": start,
+                                "p2": end,
+                                "stroke_width": float(line.get("width", line.get("stroke_width", 1.0))),
+                                "length": float(length),
+                                "color": line.get("color", [0, 0, 0]),
+                                "is_dashed": bool(line.get("is_dashed", False)),
+                                "angle": float(line.get("angle")) if line.get("angle") is not None else None
+                            }
+                            lines.append(converted_line)
+                            
+                            # Log successful conversion
+                            if len(lines) <= 3:
+                                logger.info(f"Converted line {len(lines)}: {start} -> {end}, length: {length}")
+                        
+                    except Exception as e:
+                        logger.warning(f"Error converting line: {e}")
+                        continue
         
         # Convert texts
         converted_texts = []
@@ -184,11 +249,16 @@ def convert_vector_data_to_filter_format(vector_data: Dict) -> Dict:
                 elif isinstance(position, list) and len(position) == 2:
                     position = [float(position[0]), float(position[1])]
                 else:
-                    bbox = text.get("bounding_box", [0, 0, 100, 20])
-                    position = [float(bbox[0]), float(bbox[1])]
+                    bbox = text.get("bbox", text.get("bounding_box", [0, 0, 100, 20]))
+                    if isinstance(bbox, dict):
+                        position = [float(bbox.get("x0", 0)), float(bbox.get("y0", 0))]
+                    else:
+                        position = [float(bbox[0]), float(bbox[1])]
                 
-                bbox = text.get("bounding_box", [])
-                if len(bbox) != 4:
+                bbox = text.get("bbox", text.get("bounding_box", []))
+                if isinstance(bbox, dict):
+                    bbox = [bbox.get("x0", 0), bbox.get("y0", 0), bbox.get("x1", 100), bbox.get("y1", 20)]
+                elif len(bbox) != 4:
                     font_size = float(text.get("font_size", 12.0))
                     text_width = len(text_content) * font_size * 0.6
                     text_height = font_size * 1.2
@@ -221,6 +291,13 @@ def convert_vector_data_to_filter_format(vector_data: Dict) -> Dict:
         }
         
         logger.info(f"✅ Converted: {len(lines)} lines, {len(converted_texts)} texts")
+        
+        if len(lines) == 0:
+            logger.error("⚠️ NO LINES CONVERTED! Check Vector API response structure")
+        elif len(lines) > 0:
+            sample_line = lines[0]
+            logger.info(f"Sample converted line: {sample_line['p1']} -> {sample_line['p2']}")
+        
         return filter_data
         
     except Exception as e:
