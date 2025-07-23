@@ -18,8 +18,8 @@ PORT = int(os.environ.get("PORT", 10000))
 
 app = FastAPI(
     title="Master API",
-    description="Processes PDF by calling Vector Drawing API and Pre-Filter API with robust error handling",
-    version="1.2.1"
+    description="Processes PDF by calling Vector Drawing API and Pre-Filter API with correct JSON structure",
+    version="1.3.0"
 )
 
 # CORS middleware
@@ -31,11 +31,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API URLs - CORRECT: Using actual deployed URL
-VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"  # Correct URL as confirmed
+# API URLs
+VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
 PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/filter/"
 
-# Add DNS and connectivity debugging
+# Retry settings
+MAX_RETRIES = 3
+REQUEST_TIMEOUT = 600
+
 def test_vector_api_connectivity():
     """Test basic connectivity to Vector API"""
     try:
@@ -55,7 +58,6 @@ def test_vector_api_connectivity():
         health_url = f"https://{host}/health/"
         health_response = requests.get(health_url, timeout=10)
         logger.info(f"Health endpoint test: {health_response.status_code}")
-        logger.info(f"Health response: {health_response.text}")
         
         return True
         
@@ -63,12 +65,8 @@ def test_vector_api_connectivity():
         logger.error(f"Connectivity test failed: {e}")
         return False
 
-# Retry settings
-MAX_RETRIES = 3
-REQUEST_TIMEOUT = 600  # 10 minutes
-
 async def call_vector_api_with_retry(file_content: bytes, filename: str, params: dict) -> requests.Response:
-    """Call Vector Drawing API with robust retry logic and detailed debugging"""
+    """Call Vector Drawing API with robust retry logic"""
     
     logger.info(f"=== Vector API Call Details ===")
     logger.info(f"URL: {VECTOR_API_URL}")
@@ -76,7 +74,6 @@ async def call_vector_api_with_retry(file_content: bytes, filename: str, params:
     logger.info(f"Params: {params}")
     
     # Test connectivity first
-    logger.info("=== Testing Vector API Connectivity ===")
     connectivity_ok = test_vector_api_connectivity()
     if not connectivity_ok:
         logger.error("❌ Basic connectivity test failed!")
@@ -93,76 +90,50 @@ async def call_vector_api_with_retry(file_content: bytes, filename: str, params:
                 logger.info(f"🔄 Waking up Vector API service...")
                 wake_response = requests.get(wake_url, timeout=30)
                 logger.info(f"Wake response: {wake_response.status_code}")
-                time.sleep(2)  # Give it a moment to wake up
+                time.sleep(2)
             except Exception as e:
                 logger.warning(f"Wake up request failed: {e}")
             
-            # Prepare request with detailed logging
+            # Prepare request
             files = {'file': (filename, file_content, 'application/pdf')}
             headers = {
-                'User-Agent': 'Master-API/1.2.1',
+                'User-Agent': 'Master-API/1.3.0',
                 'Accept': 'application/json, text/plain, */*',
                 'Accept-Encoding': 'gzip, deflate',
                 'Connection': 'close'
             }
             
             logger.info(f"📤 Making POST request to {VECTOR_API_URL}")
-            logger.info(f"Headers: {headers}")
-            logger.info(f"Files: file='{filename}' ({len(file_content)} bytes, type='application/pdf')")
-            logger.info(f"Params: {params}")
             
-            # Use requests.post directly with verbose logging
             start_time = time.time()
             
-            try:
-                response = requests.post(
-                    VECTOR_API_URL,
-                    files=files,
-                    params=params,
-                    headers=headers,
-                    timeout=(30, 600),  # (connect_timeout, read_timeout)
-                    stream=False,
-                    verify=True
-                )
-                
-                request_time = time.time() - start_time
-                logger.info(f"📥 Response received after {request_time:.2f}s")
-                
-            except requests.exceptions.ConnectTimeout:
-                logger.error("❌ Connection timeout (30s)")
-                raise
-            except requests.exceptions.ReadTimeout:
-                logger.error("❌ Read timeout (600s)")
-                raise
-            except requests.exceptions.ConnectionError as e:
-                logger.error(f"❌ Connection error: {e}")
-                raise
+            response = requests.post(
+                VECTOR_API_URL,
+                files=files,
+                params=params,
+                headers=headers,
+                timeout=(30, 600),
+                stream=False,
+                verify=True
+            )
             
-            # Log detailed response info
-            logger.info(f"📊 Vector API Response Details:")
+            request_time = time.time() - start_time
+            logger.info(f"📥 Response received after {request_time:.2f}s")
+            
+            logger.info(f"📊 Vector API Response:")
             logger.info(f"  Status Code: {response.status_code}")
-            logger.info(f"  Reason: {response.reason}")
-            logger.info(f"  Headers: {dict(response.headers)}")
             logger.info(f"  Content Length: {len(response.content)}")
-            logger.info(f"  Content Type: {response.headers.get('content-type', 'unknown')}")
-            
-            if response.content:
-                content_preview = response.text[:300] if response.text else str(response.content[:300])
-                logger.info(f"  Content Preview: {content_preview}...")
-            else:
-                logger.warning("  ⚠️  Empty response content!")
             
             if response.status_code == 200:
                 logger.info("✅ Vector API call successful")
                 return response
             else:
-                logger.error(f"❌ Vector API returned {response.status_code}")
-                logger.error(f"Full response body: {response.text}")
+                logger.error(f"❌ Vector API returned {response.status_code}: {response.text}")
                 
                 if attempt == MAX_RETRIES - 1:
                     raise HTTPException(
                         status_code=response.status_code,
-                        detail=f"Vector API failed after {MAX_RETRIES} attempts. Status: {response.status_code}, Body: {response.text[:200]}"
+                        detail=f"Vector API failed after {MAX_RETRIES} attempts. Status: {response.status_code}"
                     )
                     
         except requests.exceptions.Timeout as e:
@@ -170,56 +141,34 @@ async def call_vector_api_with_retry(file_content: bytes, filename: str, params:
             if attempt == MAX_RETRIES - 1:
                 raise HTTPException(
                     status_code=504,
-                    detail=f"Vector API timeout after {MAX_RETRIES} attempts. The service may be overloaded or sleeping."
-                )
-                
-        except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
-            logger.warning(f"🔌 Connection error on attempt {attempt + 1}: {str(e)}")
-            if attempt == MAX_RETRIES - 1:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Vector API connection failed after {MAX_RETRIES} attempts: {str(e)}"
+                    detail=f"Vector API timeout after {MAX_RETRIES} attempts"
                 )
                 
         except Exception as e:
-            logger.error(f"💥 Unexpected error on attempt {attempt + 1}")
-            logger.error(f"Error type: {type(e).__name__}")
-            logger.error(f"Error message: {str(e)}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(f"💥 Error on attempt {attempt + 1}: {type(e).__name__}: {str(e)}")
             
             if attempt == MAX_RETRIES - 1:
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Vector API failed after {MAX_RETRIES} attempts: {type(e).__name__}: {str(e)}"
+                    detail=f"Vector API failed after {MAX_RETRIES} attempts: {str(e)}"
                 )
         
-        # Wait before retry with exponential backoff
+        # Wait before retry
         if attempt < MAX_RETRIES - 1:
-            wait_time = min((2 ** attempt) + 1, 30)  # Cap at 30 seconds
+            wait_time = min((2 ** attempt) + 1, 30)
             logger.info(f"⏳ Waiting {wait_time}s before retry...")
             await asyncio.sleep(wait_time)
     
-    # Should never reach here, but just in case
     raise HTTPException(status_code=500, detail="Vector API failed after all retries")
 
 def convert_vision_coordinates_to_pdf(vision_data: Dict, pdf_page_size: Dict) -> Dict:
-    """
-    Convert vision coordinates from image pixels to PDF coordinates
-    
-    Args:
-        vision_data: Vision output with image coordinates
-        pdf_page_size: {"width": 3370.0, "height": 2384.0} from Vector API
-    
-    Returns:
-        Vision data with converted coordinates
-    """
+    """Convert vision coordinates from image pixels to PDF coordinates"""
     if not vision_data or not pdf_page_size:
         logger.warning("Missing vision data or PDF page size for coordinate conversion")
         return vision_data
     
     try:
-        # Get image metadata from vision output
+        # Get image metadata
         image_meta = vision_data.get("image_metadata", {})
         image_width_px = image_meta.get("image_width_pixels", 1)
         image_height_px = image_meta.get("image_height_pixels", 1)
@@ -236,14 +185,11 @@ def convert_vision_coordinates_to_pdf(vision_data: Dict, pdf_page_size: Dict) ->
         scale_x = pdf_width_pts / image_width_px
         scale_y = pdf_height_pts / image_height_px
         
-        logger.info(f"  Scale factors: X={scale_x:.6f}, Y={scale_y:.6f}")
-        
-        # Convert regions
+        # Convert regions to PDF coordinates
         converted_regions = []
         for region in vision_data.get("regions", []):
             coord_block = region.get("coordinate_block", [])
             if len(coord_block) >= 4:
-                # Original coordinates in image pixels: [x1, y1, x2, y2]
                 x1_img, y1_img, x2_img, y2_img = coord_block
                 
                 # Convert to PDF points
@@ -252,37 +198,21 @@ def convert_vision_coordinates_to_pdf(vision_data: Dict, pdf_page_size: Dict) ->
                 x2_pdf = x2_img * scale_x
                 y2_pdf = y2_img * scale_y
                 
-                # Create converted region
                 converted_region = region.copy()
-                converted_region["coordinate_block_pdf"] = [
+                converted_region["coordinate_block"] = [
                     round(x1_pdf, 2), 
                     round(y1_pdf, 2), 
                     round(x2_pdf, 2), 
                     round(y2_pdf, 2)
                 ]
-                converted_region["coordinate_block_original"] = coord_block
                 converted_regions.append(converted_region)
                 
                 logger.info(f"  Region '{region.get('label', 'unnamed')}':")
-                logger.info(f"    Image: [{x1_img}, {y1_img}, {x2_img}, {y2_img}]")
-                logger.info(f"    PDF:   [{x1_pdf:.1f}, {y1_pdf:.1f}, {x2_pdf:.1f}, {y2_pdf:.1f}]")
+                logger.info(f"    PDF: [{x1_pdf:.1f}, {y1_pdf:.1f}, {x2_pdf:.1f}, {y2_pdf:.1f}]")
         
-        # Create converted vision data
+        # Return converted vision data
         converted_vision = vision_data.copy()
         converted_vision["regions"] = converted_regions
-        converted_vision["conversion_info"] = {
-            "scale_x": round(scale_x, 6),
-            "scale_y": round(scale_y, 6),
-            "original_image_size": {
-                "width_px": image_width_px,
-                "height_px": image_height_px
-            },
-            "pdf_page_size": {
-                "width_pts": pdf_width_pts,
-                "height_pts": pdf_height_pts
-            },
-            "conversion_applied": True
-        }
         
         logger.info(f"Successfully converted {len(converted_regions)} regions")
         return converted_vision
@@ -291,22 +221,118 @@ def convert_vision_coordinates_to_pdf(vision_data: Dict, pdf_page_size: Dict) ->
         logger.error(f"Error converting coordinates: {e}")
         return vision_data
 
+def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1) -> Dict:
+    """
+    Convert Vector API output to Filter API expected format
+    
+    Vector API returns: {"pages": [...], "summary": {...}, "metadata": {...}}
+    Filter API expects: {"page_number": 1, "pages": [...]}
+    """
+    try:
+        logger.info("=== Converting Vector Data to Filter Format ===")
+        
+        # Extract pages from Vector API response
+        pages = vector_data.get("pages", [])
+        if not pages:
+            logger.error("No pages found in vector data")
+            raise ValueError("No pages found in vector data")
+        
+        logger.info(f"Found {len(pages)} pages in vector data")
+        
+        # Convert each page to Filter API format
+        converted_pages = []
+        for i, page in enumerate(pages):
+            logger.info(f"Converting page {i + 1}")
+            
+            # Get page size
+            page_size = page.get("page_size", {"width": 595.0, "height": 842.0})
+            logger.info(f"  Page size: {page_size}")
+            
+            # Extract drawings data and convert to lines/texts/symbols
+            drawings = page.get("drawings", {})
+            texts = page.get("texts", [])
+            
+            # Convert vector lines
+            lines = []
+            vector_lines = drawings.get("lines", [])
+            for line in vector_lines:
+                converted_line = {
+                    "p1": line.get("start", [0.0, 0.0]),
+                    "p2": line.get("end", [0.0, 0.0]),
+                    "stroke_width": line.get("stroke_width", 1.0),
+                    "length": line.get("length", 0.0),
+                    "color": line.get("color", [0, 0, 0]),
+                    "is_dashed": line.get("is_dashed", False),
+                    "angle": line.get("angle", None)
+                }
+                lines.append(converted_line)
+            
+            logger.info(f"  Converted {len(lines)} lines")
+            
+            # Convert texts
+            converted_texts = []
+            for text in texts:
+                converted_text = {
+                    "text": text.get("text", ""),
+                    "position": text.get("position", [0.0, 0.0]),
+                    "font_size": text.get("font_size", 12.0),
+                    "bounding_box": text.get("bounding_box", [0.0, 0.0, 0.0, 0.0])
+                }
+                converted_texts.append(converted_text)
+            
+            logger.info(f"  Converted {len(converted_texts)} texts")
+            
+            # Convert symbols (from other drawing elements)
+            symbols = []
+            for shape_type in ["rectangles", "curves", "polygons", "circles"]:
+                shapes = drawings.get(shape_type, [])
+                for shape in shapes:
+                    symbol = {
+                        "type": shape_type.rstrip('s'),  # "rectangles" -> "rectangle"
+                        "bounding_box": shape.get("bounding_box", [0.0, 0.0, 0.0, 0.0]),
+                        "points": shape.get("points", [])
+                    }
+                    symbols.append(symbol)
+            
+            logger.info(f"  Converted {len(symbols)} symbols")
+            
+            # Create converted page
+            converted_page = {
+                "page_size": page_size,
+                "lines": lines,
+                "texts": converted_texts,
+                "symbols": symbols
+            }
+            converted_pages.append(converted_page)
+        
+        # Create final structure for Filter API
+        filter_vector_data = {
+            "page_number": page_number,
+            "pages": converted_pages
+        }
+        
+        logger.info("✅ Vector data conversion completed")
+        logger.info(f"  Total pages: {len(converted_pages)}")
+        logger.info(f"  Total lines: {sum(len(p['lines']) for p in converted_pages)}")
+        logger.info(f"  Total texts: {sum(len(p['texts']) for p in converted_pages)}")
+        logger.info(f"  Total symbols: {sum(len(p['symbols']) for p in converted_pages)}")
+        
+        return filter_vector_data
+        
+    except Exception as e:
+        logger.error(f"Error converting vector data: {e}")
+        raise ValueError(f"Failed to convert vector data: {str(e)}")
+
 @app.post("/process/")
 async def process_pdf(
     file: UploadFile = File(...),
     vision_output: str = Form(...)
 ):
     """
-    Process PDF workflow:
-    1. Save uploaded PDF
-    2. Parse vision_output
-    3. Call Vector Drawing API  
-    4. Extract PDF page dimensions
-    5. Convert vision coordinates to PDF coordinates
-    6. Send to Pre-Filter API
+    Process PDF workflow with correct JSON structure for Filter API
     """
     try:
-        logger.info(f"=== Starting PDF Processing ===")
+        logger.info(f"=== Starting PDF Processing v1.3.0 ===")
         logger.info(f"Received file: {file.filename}")
         
         # Step 1: Save uploaded PDF
@@ -315,135 +341,75 @@ async def process_pdf(
             raise HTTPException(status_code=400, detail="Empty file received")
         
         file_size_mb = len(file_content) / (1024 * 1024)
-        logger.info(f"File content read: {len(file_content)} bytes ({file_size_mb:.2f} MB)")
-        
-        # Save PDF to temporary location
-        temp_pdf_path = f"/tmp/uploaded_pdf_{uuid.uuid4()}.pdf"
-        with open(temp_pdf_path, 'wb') as f:
-            f.write(file_content)
-        logger.info(f"PDF saved to: {temp_pdf_path}")
+        logger.info(f"File size: {file_size_mb:.2f} MB")
         
         # Step 2: Parse vision_output
-        vision_data = None
-        if vision_output:
-            try:
-                vision_data = json.loads(vision_output)
-                regions_count = len(vision_data.get('regions', []))
-                logger.info(f"Vision output parsed successfully - found {regions_count} regions")
-                
-                # Log vision regions for debugging
-                for i, region in enumerate(vision_data.get('regions', [])):
-                    coord_block = region.get('coordinate_block', [])
-                    label = region.get('label', 'unnamed')
-                    logger.info(f"  Region {i+1}: '{label}' -> {coord_block}")
-                    
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON parsing error for vision_output: {e}")
-                raise HTTPException(status_code=400, detail=f"Invalid vision_output JSON: {str(e)}")
-        else:
-            raise HTTPException(status_code=400, detail="vision_output is required")
+        try:
+            vision_data = json.loads(vision_output)
+            regions_count = len(vision_data.get('regions', []))
+            logger.info(f"Vision output parsed - {regions_count} regions found")
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid vision_output JSON: {str(e)}")
 
-        # Step 3: Call Vector Drawing API with robust retry
+        # Step 3: Call Vector Drawing API
         logger.info("=== Calling Vector Drawing API ===")
         
         params = {
-            'minify': 'true',  # As requested
+            'minify': 'true',
             'remove_non_essential': 'false',
             'precision': '2'
         }
         
-        try:
-            vector_response = await call_vector_api_with_retry(file_content, file.filename, params)
-        except HTTPException as e:
-            logger.error(f"Vector API failed after all retries: {e.detail}")
-            raise e
-        except Exception as e:
-            logger.error(f"Unexpected error calling Vector API: {e}")
-            raise HTTPException(status_code=500, detail=f"Vector API error: {str(e)}")
+        vector_response = await call_vector_api_with_retry(file_content, file.filename, params)
         
         # Parse vector response
-        raw_response = vector_response.text
-        logger.info(f"Vector API response length: {len(raw_response)} bytes")
-        logger.info(f"Response preview: {raw_response[:100]}...")
-        
         try:
+            raw_response = vector_response.text
+            logger.info(f"Vector API response length: {len(raw_response)} bytes")
+            
             vector_data = json.loads(raw_response)
-            logger.info(f"JSON parsed successfully, type: {type(vector_data)}")
             
             # Handle double-encoded JSON
             if isinstance(vector_data, str):
-                logger.warning("Response is double-encoded, parsing again")
                 vector_data = json.loads(vector_data)
-                logger.info(f"Second parse successful, type: {type(vector_data)}")
             
-            # Validate structure
-            if not isinstance(vector_data, dict):
-                raise ValueError("Response is not a dictionary")
-            
-            if 'pages' not in vector_data or not vector_data['pages']:
-                raise ValueError("No pages found in vector data")
+            if not isinstance(vector_data, dict) or 'pages' not in vector_data:
+                raise ValueError("Invalid vector data structure")
                 
-            logger.info(f"Vector data keys: {list(vector_data.keys())}")
-            
         except Exception as e:
-            logger.error(f"JSON parsing error: {e}")
-            # Save problematic response for debugging
-            debug_path = f"/tmp/vector_debug_{uuid.uuid4()}.json"
-            with open(debug_path, 'w') as f:
-                f.write(raw_response)
-            logger.info(f"Saved debug response to: {debug_path}")
+            logger.error(f"Vector API JSON parsing error: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to parse Vector API response: {str(e)}")
 
         # Step 4: Extract PDF page dimensions
         logger.info("=== Extracting PDF Page Dimensions ===")
         
         first_page = vector_data['pages'][0]
-        pdf_page_size = first_page.get('page_size', {})
-        
-        if not pdf_page_size:
-            logger.error("No page_size found in vector data")
-            raise HTTPException(status_code=500, detail="No page dimensions found in Vector API response")
-        
+        pdf_page_size = first_page.get('page_size', {"width": 595.0, "height": 842.0})
         logger.info(f"PDF page size: {pdf_page_size}")
-        
-        # Count extracted elements
-        page_texts = len(first_page.get('texts', []))
-        page_drawings = first_page.get('drawings', {})
-        total_vectors = sum(len(page_drawings.get(key, [])) for key in ['lines', 'rectangles', 'curves', 'polygons'])
-        
-        logger.info(f"Vector API extracted: {page_texts} texts, {total_vectors} vector elements")
 
         # Step 5: Convert vision coordinates to PDF coordinates
         logger.info("=== Converting Vision Coordinates ===")
-        
         converted_vision = convert_vision_coordinates_to_pdf(vision_data, pdf_page_size)
+
+        # Step 6: Convert Vector data to Filter API format
+        logger.info("=== Converting Vector Data Format ===")
+        filter_vector_data = convert_vector_data_to_filter_format(vector_data, page_number=1)
+
+        # Step 7: Prepare correct JSON structure for Filter API
+        logger.info("=== Preparing Filter API Request ===")
         
-        # Step 6: Prepare data for Pre-Filter API
-        logger.info("=== Preparing Data for Pre-Filter API ===")
-        
-        combined_data = {
-            "vision_output": converted_vision,
-            "vector_output": vector_data,  # Full raw vector data
-            "coordinate_bounds": vector_data.get('summary', {}).get('coordinate_bounds', {}),
-            "pdf_dimensions": vector_data.get('metadata', {}).get('pdf_dimensions', {}),
-            "metadata": {
-                "filename": file.filename,
-                "file_size_mb": file_size_mb,
-                "total_pages": vector_data.get('summary', {}).get('total_pages', 1),
-                "total_texts": vector_data.get('summary', {}).get('total_texts', page_texts),
-                "total_vectors": total_vectors,
-                "dimensions_found": vector_data.get('summary', {}).get('dimensions_found', 0),
-                "coordinate_conversion": "applied",
-                "pdf_page_size": pdf_page_size
-            }
+        filter_request_data = {
+            "vector_data": filter_vector_data,  # ✅ Correct key name
+            "vision_output": converted_vision   # ✅ Correct structure
         }
         
-        logger.info("Combined data summary:")
-        logger.info(f"  - Vision regions: {len(converted_vision.get('regions', []))} (converted)")
-        logger.info(f"  - Vector pages: {len(vector_data.get('pages', []))}")
-        logger.info(f"  - PDF page size: {pdf_page_size}")
-        
-        # Step 7: Call Pre-Filter API
+        logger.info("Filter API request structure:")
+        logger.info(f"  vector_data.page_number: {filter_vector_data.get('page_number')}")
+        logger.info(f"  vector_data.pages: {len(filter_vector_data.get('pages', []))} pages")
+        logger.info(f"  vision_output.drawing_type: {converted_vision.get('drawing_type')}")
+        logger.info(f"  vision_output.regions: {len(converted_vision.get('regions', []))} regions")
+
+        # Step 8: Call Pre-Filter API with correct structure
         logger.info("=== Calling Pre-Filter API ===")
         
         try:
@@ -451,7 +417,7 @@ async def process_pdf(
             
             filter_response = requests.post(
                 PRE_FILTER_API_URL,
-                json=combined_data,
+                json=filter_request_data,  # ✅ Sending correct JSON structure
                 headers=headers,
                 timeout=300
             )
@@ -459,86 +425,55 @@ async def process_pdf(
             logger.info(f"Pre-Filter API response status: {filter_response.status_code}")
             
             if filter_response.status_code != 200:
-                logger.warning(f"Pre-Filter API error: {filter_response.status_code}")
-                logger.warning(f"Error details: {filter_response.text}")
+                logger.error(f"Pre-Filter API error: {filter_response.status_code}")
+                logger.error(f"Error details: {filter_response.text}")
                 
-                # Return partial success with all data
                 return {
                     "status": "partial_success",
-                    "message": "Vector extraction and coordinate conversion successful, but pre-filtering failed",
+                    "message": "Vector extraction successful, but filtering failed",
                     "vector_data": vector_data,
                     "vision_data": converted_vision,
-                    "scale_data": None,
                     "filter_error": filter_response.text,
-                    "processing_stats": {
-                        "coordinate_conversion": "applied",
-                        "pdf_page_size": pdf_page_size,
-                        "regions_converted": len(converted_vision.get('regions', []))
-                    },
-                    "timestamp": "2025-07-22"
+                    "timestamp": "2025-07-23"
                 }
             
-            # Parse successful Pre-Filter response
-            try:
-                filtered_data = filter_response.json()
-                logger.info("Pre-Filter API response parsed successfully")
-            except Exception as e:
-                logger.error(f"Error parsing Pre-Filter response: {e}")
-                return {
-                    "status": "partial_success",
-                    "message": "Processing successful but filter response parsing failed",
-                    "vector_data": vector_data,
-                    "vision_data": converted_vision,
-                    "scale_data": None,
-                    "filter_error": f"Parse error: {str(e)}",
-                    "timestamp": "2025-07-22"
-                }
+            # Parse successful response
+            filtered_data = filter_response.json()
+            logger.info("✅ Pre-Filter API response parsed successfully")
             
-            # Step 8: Return successful results
+            # Step 9: Return successful results
             logger.info("=== Processing Completed Successfully ===")
             
             return {
                 "status": "success",
-                "message": "PDF processed successfully through Vector Drawing API and Pre-Filter API",
-                "vector_data": vector_data,  # Full raw vector data (for compatibility)
-                "scale_data": filtered_data,  # Filtered results (for compatibility)
-                "data": filtered_data,  # Main filtered results
-                "vision_data": converted_vision,  # Vision data with converted coordinates
+                "message": "PDF processed successfully with correct JSON structure",
+                "vector_data": vector_data,
+                "filtered_data": filtered_data,
+                "vision_data": converted_vision,
                 "processing_stats": {
-                    "original_texts": page_texts,
-                    "total_vectors": total_vectors,
-                    "regions_processed": len(converted_vision.get('regions', [])),
-                    "coordinate_conversion": "applied",
                     "pdf_page_size": pdf_page_size,
-                    "conversion_info": converted_vision.get('conversion_info', {})
+                    "regions_converted": len(converted_vision.get('regions', [])),
+                    "coordinate_conversion": "applied",
+                    "json_structure": "corrected_for_filter_api"
                 },
-                "timestamp": "2025-07-22"
+                "timestamp": "2025-07-23"
             }
             
         except Exception as e:
             logger.error(f"Error calling Pre-Filter API: {e}")
             return {
                 "status": "partial_success",
-                "message": "Vector extraction and coordinate conversion successful, but pre-filtering failed",
+                "message": "Vector extraction successful, but filtering failed",
                 "vector_data": vector_data,
                 "vision_data": converted_vision,
-                "scale_data": None,
                 "error": f"Pre-Filter API error: {str(e)}",
-                "timestamp": "2025-07-22"
+                "timestamp": "2025-07-23"
             }
-        
-        finally:
-            # Clean up temporary PDF file
-            try:
-                os.unlink(temp_pdf_path)
-                logger.info(f"Cleaned up temporary file: {temp_pdf_path}")
-            except:
-                pass
     
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error in process_pdf: {e}", exc_info=True)
+        logger.error(f"Unexpected error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/health/")
@@ -546,15 +481,15 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "version": "1.2.1",
+        "version": "1.3.0",
         "features": [
-            "PDF upload and temporary storage",
-            "Vision output parsing with region extraction",
-            "Vector Drawing API integration with robust retry logic",
-            "Precise coordinate conversion (image pixels -> PDF points)",
-            "Pre-Filter API integration with converted coordinates",
-            "Full raw vector data passthrough",
-            "IncompleteRead error handling"
+            "PDF upload and processing",
+            "Vision output parsing",
+            "Vector Drawing API integration with retry logic",
+            "Coordinate conversion (image pixels -> PDF points)",
+            "Vector data format conversion for Filter API",
+            "Correct JSON structure for Filter API",
+            "Pre-Filter API integration"
         ]
     }
 
@@ -563,25 +498,23 @@ async def root():
     """Root endpoint with API information"""
     return {
         "title": "Master API",
-        "version": "1.2.1",
-        "description": "Processes PDF with precise coordinate conversion and robust error handling",
+        "version": "1.3.0",
+        "description": "Processes PDF with correct JSON structure for Filter API",
         "workflow": [
-            "1. Receive PDF file and vision_output via multipart form",
-            "2. Save PDF and parse vision regions with image coordinates", 
-            "3. Call Vector Drawing API to extract all vector data",
-            "4. Extract PDF page dimensions (width, height in points)",
-            "5. Convert vision coordinates from image pixels to PDF points",
-            "6. Send converted vision_output + raw vector_output to Pre-Filter API",
-            "7. Return combined results with conversion statistics"
+            "1. Receive PDF file and vision_output",
+            "2. Call Vector Drawing API for vector extraction",
+            "3. Extract PDF page dimensions",
+            "4. Convert vision coordinates to PDF coordinates",
+            "5. Convert vector data to Filter API format",
+            "6. Send correct JSON structure to Filter API",
+            "7. Return combined results"
         ],
-        "coordinate_conversion": {
-            "input": "Vision regions in image pixels",
-            "output": "Vision regions in PDF points", 
-            "method": "Scale factors based on image size vs PDF page size",
-            "example": {
-                "image_size": {"width": 9969, "height": 7052},
-                "pdf_size": {"width": 3370.0, "height": 2384.0},
-                "scale_factors": {"x": 0.338, "y": 0.338}
+        "json_structure_fix": {
+            "problem": "Master API was sending 'vector_output' but Filter API expects 'vector_data'",
+            "solution": "Convert vector data to correct format and use proper keys",
+            "filter_api_expects": {
+                "vector_data": {"page_number": 1, "pages": [...]},
+                "vision_output": {"drawing_type": "...", "regions": [...]}
             }
         },
         "apis_used": {
@@ -592,6 +525,6 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting Master API v1.2.1 on port {PORT}")
-    logger.info("Features: Robust Vector API calls, coordinate conversion, IncompleteRead error handling")
+    logger.info(f"Starting Master API v1.3.0 on port {PORT}")
+    logger.info("New: Correct JSON structure for Filter API compatibility")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
