@@ -19,7 +19,7 @@ PORT = int(os.environ.get("PORT", 10000))
 app = FastAPI(
     title="Master API",
     description="Processes PDF by calling Vector Drawing API and Pre-Filter API with correct JSON structure",
-    version="1.6.0"
+    version="1.6.1"
 )
 
 # CORS middleware
@@ -91,7 +91,7 @@ async def call_vector_api_with_retry(file_content: bytes, filename: str, params:
             
             files = {'file': (filename, file_content, 'application/pdf')}
             headers = {
-                'User-Agent': 'Master-API/1.6.0',
+                'User-Agent': 'Master-API/1.6.1',
                 'Accept': 'application/json, text/plain, */*',
                 'Accept-Encoding': 'gzip, deflate',
                 'Connection': 'close'
@@ -429,56 +429,54 @@ def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1
         logger.error(f"Error converting vector data: {e}")
         raise ValueError(f"Failed to convert vector data: {str(e)}")
 
-def create_minified_output(result: Dict) -> str:
-    """Create a minified text output from the processing result"""
+def create_minified_output(result: Dict, include_symbols: bool) -> str:
+    """Create a compact minified text output for n8n, focusing on filtered data"""
     output_lines = []
-    output_lines.append("=== MASTER API PROCESSING RESULT ===\n")
-    
+    output_lines.append("MASTER API OUTPUT")
     output_lines.append(f"Status: {result.get('status', 'unknown')}")
-    output_lines.append(f"Message: {result.get('message', '')}")
-    output_lines.append(f"Timestamp: {result.get('timestamp', '')}\n")
+    output_lines.append(f"Timestamp: {result.get('timestamp', time.strftime('%Y-%m-%d %H:%M:%S'))}")
     
     if 'processing_stats' in result:
         stats = result['processing_stats']
-        output_lines.append("Processing Stats:")
-        output_lines.append(f"  PDF Page Size: {stats.get('pdf_page_size', {})}")
-        output_lines.append(f"  Regions Converted: {stats.get('regions_converted', 0)}")
-        output_lines.append(f"  Version: {stats.get('version', '')}\n")
+        output_lines.append(f"Page Size: {stats.get('pdf_page_size', {}).get('width', 0)}x{stats.get('pdf_page_size', {}).get('height', 0)}")
+        output_lines.append(f"Regions: {stats.get('regions_converted', 0)}")
     
     if 'filtered_data' in result and 'filtered' in result['filtered_data']:
         filtered = result['filtered_data']['filtered']
-        output_lines.append("Filtered Data Summary:")
-        output_lines.append(f"  Drawing Type: {filtered.get('drawing_type', '')}")
-        output_lines.append(f"  Page Number: {filtered.get('page_number', '')}")
-        output_lines.append(f"  Total Regions: {len(filtered.get('regions', []))}")
+        output_lines.append(f"Drawing Type: {filtered.get('drawing_type', 'unknown')}")
+        output_lines.append(f"Page: {filtered.get('page_number', 1)}")
         
         for region in filtered.get('regions', []):
-            output_lines.append(f"\n  Region: {region.get('label', 'unnamed')}")
-            output_lines.append(f"    Lines: {len(region.get('lines', []))}")
-            output_lines.append(f"    Texts: {len(region.get('texts', []))}")
-            output_lines.append(f"    Symbols: {len(region.get('symbols', []))}")
-            
-            texts = region.get('texts', [])
-            if texts:
-                output_lines.append("    Sample texts:")
-                for text in texts[:5]:
-                    output_lines.append(f"      - {text.get('text', '')}")
+            output_lines.append(f"Region: {region.get('label', 'unnamed')}")
+            output_lines.append(f"  Lines: {len(region.get('lines', []))}")
+            output_lines.append(f"  Texts: {len(region.get('texts', []))}")
+            if region.get('texts', []):
+                output_lines.append("  Sample Texts:")
+                for text in region.get('texts', [])[:3]:  # Max 3 sample texts
+                    output_lines.append(f"    - {text.get('text', '')} at {text.get('position', [0, 0])}")
+            if include_symbols:
+                output_lines.append(f"  Symbols: {len(region.get('symbols', []))}")
         
         unassigned = filtered.get('unassigned', {})
-        output_lines.append(f"\n  Unassigned Elements:")
-        output_lines.append(f"    Lines: {len(unassigned.get('lines', []))}")
-        output_lines.append(f"    Texts: {len(unassigned.get('texts', []))}")
-        output_lines.append(f"    Symbols: {len(unassigned.get('symbols', []))}")
+        output_lines.append("Unassigned:")
+        output_lines.append(f"  Lines: {len(unassigned.get('lines', []))}")
+        output_lines.append(f"  Texts: {len(unassigned.get('texts', []))}")
+        if unassigned.get('texts', []):
+            output_lines.append("  Sample Unassigned Texts:")
+            for text in unassigned.get('texts', [])[:3]:
+                output_lines.append(f"    - {text.get('text', '')} at {text.get('position', [0, 0])}")
+        if include_symbols:
+            output_lines.append(f"  Symbols: {len(unassigned.get('symbols', []))}")
     
     if 'metadata' in result.get('filtered_data', {}):
         metadata = result['filtered_data']['metadata']
-        output_lines.append(f"\nProcessing Metadata:")
-        output_lines.append(f"  Processed Elements: {metadata.get('processed_elements', 0)}")
-        output_lines.append(f"  Filtered Elements: {metadata.get('filtered_elements', 0)}")
-        output_lines.append(f"  Processing Time: {metadata.get('processing_time_seconds', 0):.2f}s")
+        output_lines.append(f"Processed: {metadata.get('processed_elements', 0)}")
+        output_lines.append(f"Filtered: {metadata.get('filtered_elements', 0)}")
+        output_lines.append(f"Time: {metadata.get('processing_time_seconds', 0):.2f}s")
     
-    if 'errors' in result:
-        output_lines.append(f"\nErrors: {result['errors']}")
+    if 'errors' in result['filtered_data']:
+        if result['filtered_data']['errors']:
+            output_lines.append(f"Errors: {', '.join(result['filtered_data']['errors'])}")
     
     return "\n".join(output_lines)
 
@@ -491,7 +489,7 @@ async def process_pdf(
 ):
     """Process PDF workflow with correct JSON structure for Filter API"""
     try:
-        logger.info(f"=== Starting PDF Processing v1.6.0 ===")
+        logger.info(f"=== Starting PDF Processing v1.6.1 ===")
         logger.info(f"Received file: {file.filename}")
         logger.info(f"Output format: {output_format}")
         logger.info(f"Include symbols: {include_symbols}")
@@ -585,14 +583,14 @@ async def process_pdf(
                     "vector_data": vector_data,
                     "vision_data": converted_vision,
                     "filter_error": filter_response.text,
-                    "timestamp": time.strftime("%Y-%m-%d"),
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "processing_stats": {
                         "pdf_page_size": pdf_page_size,
                         "regions_converted": len(converted_vision.get('regions', [])),
                         "coordinate_conversion": "applied",
                         "json_structure": "corrected_for_filter_api",
                         "include_symbols": include_symbols,
-                        "version": "1.6.0"
+                        "version": "1.6.1"
                     }
                 }
             else:
@@ -613,13 +611,13 @@ async def process_pdf(
                         "coordinate_conversion": "applied",
                         "json_structure": "corrected_for_filter_api",
                         "include_symbols": include_symbols,
-                        "version": "1.6.0"
+                        "version": "1.6.1"
                     },
-                    "timestamp": time.strftime("%Y-%m-%d")
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                 }
             
             if output_format == "txt":
-                minified_output = create_minified_output(result)
+                minified_output = create_minified_output(result, include_symbols)
                 return PlainTextResponse(content=minified_output)
             else:
                 return result
@@ -632,19 +630,19 @@ async def process_pdf(
                 "vector_data": vector_data,
                 "vision_data": converted_vision,
                 "error": f"Pre-Filter API error: {str(e)}",
-                "timestamp": time.strftime("%Y-%m-%d"),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "processing_stats": {
                     "pdf_page_size": pdf_page_size,
                     "regions_converted": len(converted_vision.get('regions', [])),
                     "coordinate_conversion": "applied",
                     "json_structure": "corrected_for_filter_api",
                     "include_symbols": include_symbols,
-                    "version": "1.6.0"
+                    "version": "1.6.1"
                 }
             }
             
             if output_format == "txt":
-                minified_output = create_minified_output(result)
+                minified_output = create_minified_output(result, include_symbols)
                 return PlainTextResponse(content=minified_output)
             else:
                 return result
@@ -660,7 +658,7 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "version": "1.6.0",
+        "version": "1.6.1",
         "features": [
             "PDF upload and processing",
             "Vision output parsing",
@@ -672,7 +670,7 @@ async def health():
             "Optional symbol conversion with point-based bbox generation",
             "Correct JSON structure for Filter API",
             "Pre-Filter API integration",
-            "Minified text output option"
+            "Optimized minified text output for n8n"
         ],
         "fixes": [
             "Fixed text position conversion from dict to list",
@@ -681,7 +679,8 @@ async def health():
             "Repairs zero-area bounding boxes",
             "Preserves all valid texts and symbols",
             "Optional symbol inclusion for performance",
-            "Detailed logging for skipped elements"
+            "Detailed logging for skipped elements",
+            "Compact minified output for n8n"
         ]
     }
 
@@ -690,8 +689,8 @@ async def root():
     """Root endpoint with API information"""
     return {
         "title": "Master API",
-        "version": "1.6.0",
-        "description": "Processes PDF with correct JSON structure for Filter API",
+        "version": "1.6.1",
+        "description": "Processes PDF with correct JSON structure for Filter API, with optimized minified output",
         "workflow": [
             "1. Receive PDF file and vision_output",
             "2. Call Vector Drawing API for vector extraction",
@@ -703,7 +702,7 @@ async def root():
         ],
         "json_structure_fix": {
             "problem": "Master API was losing symbols due to invalid bounding boxes",
-            "solution": "Generates bounding boxes for curves from points, optional symbol inclusion",
+            "solution": "Generates bounding boxes for curves from points, optional symbol inclusion, compact TXT output",
             "filter_api_expects": {
                 "vector_data": {
                     "page_number": 1, 
@@ -742,6 +741,6 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting Master API v1.6.0 on port {PORT}")
-    logger.info("New: Optional symbol inclusion with include_symbols parameter")
+    logger.info(f"Starting Master API v1.6.1 on port {PORT}")
+    logger.info("New: Optimized minified output for n8n")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
