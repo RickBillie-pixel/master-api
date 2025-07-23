@@ -3,6 +3,7 @@ import tempfile
 import uuid
 from fastapi import FastAPI, UploadFile, HTTPException, Form, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 import logging
 import requests
 import json
@@ -19,7 +20,7 @@ PORT = int(os.environ.get("PORT", 10000))
 app = FastAPI(
     title="Master API",
     description="Processes PDF by calling Vector Drawing API and Pre-Filter API with correct JSON structure",
-    version="1.4.0"
+    version="1.5.0"
 )
 
 # CORS middleware
@@ -97,7 +98,7 @@ async def call_vector_api_with_retry(file_content: bytes, filename: str, params:
             # Prepare request
             files = {'file': (filename, file_content, 'application/pdf')}
             headers = {
-                'User-Agent': 'Master-API/1.4.0',
+                'User-Agent': 'Master-API/1.5.0',
                 'Accept': 'application/json, text/plain, */*',
                 'Accept-Encoding': 'gzip, deflate',
                 'Connection': 'close'
@@ -281,7 +282,7 @@ def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1
             
             logger.info(f"  Converted {len(lines)} lines")
             
-            # Convert texts - FIXED VERSION
+            # Convert texts - FIXED VERSION that handles dict positions
             converted_texts = []
             for text in texts:
                 try:
@@ -291,7 +292,7 @@ def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1
                         logger.warning("Empty text content, skipping")
                         continue
                     
-                    # Get position - ensure it's a list with 2 floats
+                    # Get position - handle both dict format and list format
                     position = text.get("position")
                     if not position:
                         # Try to derive from bounding box if position is missing
@@ -302,9 +303,18 @@ def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1
                             logger.warning(f"No position for text '{text_content}', skipping")
                             continue
                     
-                    # Ensure position is a list with 2 elements
-                    if not isinstance(position, list) or len(position) != 2:
-                        logger.warning(f"Invalid position format for text '{text_content}': {position}")
+                    # Convert dict position to list
+                    if isinstance(position, dict):
+                        x = position.get("x", 0.0)
+                        y = position.get("y", 0.0)
+                        position = [float(x), float(y)]
+                    elif isinstance(position, list):
+                        if len(position) != 2:
+                            logger.warning(f"Invalid position length for text '{text_content}': {len(position)}")
+                            continue
+                        position = [float(position[0]), float(position[1])]
+                    else:
+                        logger.warning(f"Invalid position type for text '{text_content}': {type(position)}")
                         continue
                     
                     # Get bounding box
@@ -320,7 +330,7 @@ def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1
                             float(position[0]) + text_width,
                             float(position[1]) + text_height
                         ]
-                        logger.info(f"Created default bbox for text '{text_content}'")
+                        logger.debug(f"Created default bbox for text '{text_content}'")
                     
                     # Validate bounding box
                     if len(bbox) != 4:
@@ -344,7 +354,7 @@ def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1
                     
                     converted_text = {
                         "text": str(text_content),
-                        "position": [float(position[0]), float(position[1])],
+                        "position": position,  # Now guaranteed to be [float, float]
                         "font_size": float(text.get("font_size", 12.0)),
                         "bounding_box": bbox
                     }
@@ -415,17 +425,80 @@ def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1
         logger.error(f"Error converting vector data: {e}")
         raise ValueError(f"Failed to convert vector data: {str(e)}")
 
+def create_minified_output(result: Dict) -> str:
+    """Create a minified text output from the processing result"""
+    output_lines = []
+    output_lines.append("=== MASTER API PROCESSING RESULT ===\n")
+    
+    # Basic info
+    output_lines.append(f"Status: {result.get('status', 'unknown')}")
+    output_lines.append(f"Message: {result.get('message', '')}")
+    output_lines.append(f"Timestamp: {result.get('timestamp', '')}\n")
+    
+    # Processing stats
+    if 'processing_stats' in result:
+        stats = result['processing_stats']
+        output_lines.append("Processing Stats:")
+        output_lines.append(f"  PDF Page Size: {stats.get('pdf_page_size', {})}")
+        output_lines.append(f"  Regions Converted: {stats.get('regions_converted', 0)}")
+        output_lines.append(f"  Version: {stats.get('version', '')}\n")
+    
+    # Filtered data summary
+    if 'filtered_data' in result and 'filtered' in result['filtered_data']:
+        filtered = result['filtered_data']['filtered']
+        output_lines.append("Filtered Data Summary:")
+        output_lines.append(f"  Drawing Type: {filtered.get('drawing_type', '')}")
+        output_lines.append(f"  Page Number: {filtered.get('page_number', '')}")
+        output_lines.append(f"  Total Regions: {len(filtered.get('regions', []))}")
+        
+        # Region summaries
+        for region in filtered.get('regions', []):
+            output_lines.append(f"\n  Region: {region.get('label', 'unnamed')}")
+            output_lines.append(f"    Lines: {len(region.get('lines', []))}")
+            output_lines.append(f"    Texts: {len(region.get('texts', []))}")
+            output_lines.append(f"    Symbols: {len(region.get('symbols', []))}")
+            
+            # Sample texts
+            texts = region.get('texts', [])
+            if texts:
+                output_lines.append("    Sample texts:")
+                for text in texts[:5]:  # First 5 texts
+                    output_lines.append(f"      - {text.get('text', '')}")
+        
+        # Unassigned elements
+        unassigned = filtered.get('unassigned', {})
+        output_lines.append(f"\n  Unassigned Elements:")
+        output_lines.append(f"    Lines: {len(unassigned.get('lines', []))}")
+        output_lines.append(f"    Texts: {len(unassigned.get('texts', []))}")
+        output_lines.append(f"    Symbols: {len(unassigned.get('symbols', []))}")
+    
+    # Metadata
+    if 'metadata' in result.get('filtered_data', {}):
+        metadata = result['filtered_data']['metadata']
+        output_lines.append(f"\nProcessing Metadata:")
+        output_lines.append(f"  Processed Elements: {metadata.get('processed_elements', 0)}")
+        output_lines.append(f"  Filtered Elements: {metadata.get('filtered_elements', 0)}")
+        output_lines.append(f"  Processing Time: {metadata.get('processing_time_seconds', 0):.2f}s")
+    
+    # Errors
+    if 'errors' in result:
+        output_lines.append(f"\nErrors: {result['errors']}")
+    
+    return "\n".join(output_lines)
+
 @app.post("/process/")
 async def process_pdf(
     file: UploadFile = File(...),
-    vision_output: str = Form(...)
+    vision_output: str = Form(...),
+    output_format: str = Form(default="json")  # json or txt
 ):
     """
     Process PDF workflow with correct JSON structure for Filter API
     """
     try:
-        logger.info(f"=== Starting PDF Processing v1.4.0 ===")
+        logger.info(f"=== Starting PDF Processing v1.5.0 ===")
         logger.info(f"Received file: {file.filename}")
+        logger.info(f"Output format: {output_format}")
         
         # Step 1: Save uploaded PDF
         file_content = await file.read()
@@ -520,48 +593,61 @@ async def process_pdf(
                 logger.error(f"Pre-Filter API error: {filter_response.status_code}")
                 logger.error(f"Error details: {filter_response.text}")
                 
-                return {
+                result = {
                     "status": "partial_success",
                     "message": "Vector extraction successful, but filtering failed",
                     "vector_data": vector_data,
                     "vision_data": converted_vision,
                     "filter_error": filter_response.text,
-                    "timestamp": "2025-07-23"
+                    "timestamp": time.strftime("%Y-%m-%d")
+                }
+            else:
+                # Parse successful response
+                filtered_data = filter_response.json()
+                logger.info("✅ Pre-Filter API response parsed successfully")
+                
+                # Step 9: Return successful results
+                logger.info("=== Processing Completed Successfully ===")
+                
+                result = {
+                    "status": "success",
+                    "message": "PDF processed successfully with correct JSON structure",
+                    "vector_data": vector_data,
+                    "filtered_data": filtered_data,
+                    "vision_data": converted_vision,
+                    "processing_stats": {
+                        "pdf_page_size": pdf_page_size,
+                        "regions_converted": len(converted_vision.get('regions', [])),
+                        "coordinate_conversion": "applied",
+                        "json_structure": "corrected_for_filter_api",
+                        "version": "1.5.0"
+                    },
+                    "timestamp": time.strftime("%Y-%m-%d")
                 }
             
-            # Parse successful response
-            filtered_data = filter_response.json()
-            logger.info("✅ Pre-Filter API response parsed successfully")
-            
-            # Step 9: Return successful results
-            logger.info("=== Processing Completed Successfully ===")
-            
-            return {
-                "status": "success",
-                "message": "PDF processed successfully with correct JSON structure",
-                "vector_data": vector_data,
-                "filtered_data": filtered_data,
-                "vision_data": converted_vision,
-                "processing_stats": {
-                    "pdf_page_size": pdf_page_size,
-                    "regions_converted": len(converted_vision.get('regions', [])),
-                    "coordinate_conversion": "applied",
-                    "json_structure": "corrected_for_filter_api",
-                    "version": "1.4.0"
-                },
-                "timestamp": "2025-07-23"
-            }
-            
+            # Return based on requested format
+            if output_format == "txt":
+                minified_output = create_minified_output(result)
+                return PlainTextResponse(content=minified_output)
+            else:
+                return result
+                
         except Exception as e:
             logger.error(f"Error calling Pre-Filter API: {e}")
-            return {
+            result = {
                 "status": "partial_success",
                 "message": "Vector extraction successful, but filtering failed",
                 "vector_data": vector_data,
                 "vision_data": converted_vision,
                 "error": f"Pre-Filter API error: {str(e)}",
-                "timestamp": "2025-07-23"
+                "timestamp": time.strftime("%Y-%m-%d")
             }
+            
+            if output_format == "txt":
+                minified_output = create_minified_output(result)
+                return PlainTextResponse(content=minified_output)
+            else:
+                return result
     
     except HTTPException:
         raise
@@ -574,19 +660,22 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "version": "1.4.0",
+        "version": "1.5.0",
         "features": [
             "PDF upload and processing",
             "Vision output parsing",
             "Vector Drawing API integration with retry logic",
             "Coordinate conversion (image pixels -> PDF points)",
             "Fixed vector data format conversion for Filter API",
+            "Handles dict-format positions (x,y) to list format",
             "Robust text position and bounding box handling",
             "Correct JSON structure for Filter API",
-            "Pre-Filter API integration"
+            "Pre-Filter API integration",
+            "Minified text output option"
         ],
         "fixes": [
-            "Fixed text position validation",
+            "Fixed text position validation for dict format",
+            "Converts {x:, y:} positions to [x, y] format",
             "Fixed bounding box validation and ordering",
             "Added default bounding box creation",
             "Added proper error handling for invalid data"
@@ -598,7 +687,7 @@ async def root():
     """Root endpoint with API information"""
     return {
         "title": "Master API",
-        "version": "1.4.0",
+        "version": "1.5.0",
         "description": "Processes PDF with correct JSON structure for Filter API",
         "workflow": [
             "1. Receive PDF file and vision_output",
@@ -607,11 +696,11 @@ async def root():
             "4. Convert vision coordinates to PDF coordinates",
             "5. Convert vector data to Filter API format with proper validation",
             "6. Send correct JSON structure to Filter API",
-            "7. Return combined results"
+            "7. Return combined results (JSON or minified TXT)"
         ],
         "json_structure_fix": {
-            "problem": "Master API was sending invalid text positions and bounding boxes",
-            "solution": "Added robust validation and conversion for all vector elements",
+            "problem": "Master API was sending invalid text positions (dict format instead of list)",
+            "solution": "Converts {'x': val, 'y': val} to [x, y] format for Filter API",
             "filter_api_expects": {
                 "vector_data": {
                     "page_number": 1, 
@@ -628,7 +717,7 @@ async def root():
                         }],
                         "texts": [{
                             "text": "string",
-                            "position": "[float, float]",
+                            "position": "[float, float]",  # NOT {"x": float, "y": float}
                             "font_size": "float",
                             "bounding_box": "[x0, y0, x2, y3] where x0 < x2 and y0 < y3"
                         }],
@@ -650,6 +739,6 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting Master API v1.4.0 on port {PORT}")
-    logger.info("New: Fixed text position and bounding box validation")
+    logger.info(f"Starting Master API v1.5.0 on port {PORT}")
+    logger.info("New: Fixed dict to list position conversion for texts")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
