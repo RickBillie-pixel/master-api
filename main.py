@@ -33,7 +33,7 @@ app.add_middleware(
 
 # API URLs - CORRECT: Using actual deployed URL
 VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"  # Correct URL as confirmed
-PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/pre-scale"
+PRE_FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/filter/"
 
 # Add DNS and connectivity debugging
 def test_vector_api_connectivity():
