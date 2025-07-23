@@ -1,3 +1,4 @@
+# main.py (Master API)
 import os
 import tempfile
 import uuid
@@ -9,7 +10,7 @@ import requests
 import json
 import time
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -20,7 +21,7 @@ PORT = int(os.environ.get("PORT", 10000))
 app = FastAPI(
     title="Master API",
     description="Processes PDF by calling Vector Drawing API and Pre-Filter API with correct JSON structure",
-    version="1.5.0"
+    version="1.5.1"
 )
 
 # CORS middleware
@@ -98,7 +99,7 @@ async def call_vector_api_with_retry(file_content: bytes, filename: str, params:
             # Prepare request
             files = {'file': (filename, file_content, 'application/pdf')}
             headers = {
-                'User-Agent': 'Master-API/1.5.0',
+                'User-Agent': 'Master-API/1.5.1',
                 'Accept': 'application/json, text/plain, */*',
                 'Accept-Encoding': 'gzip, deflate',
                 'Connection': 'close'
@@ -199,6 +200,16 @@ def convert_vision_coordinates_to_pdf(vision_data: Dict, pdf_page_size: Dict) ->
                 x2_pdf = x2_img * scale_x
                 y2_pdf = y2_img * scale_y
                 
+                # Ensure correct order (x1 < x2, y1 < y2)
+                x1_pdf, x2_pdf = min(x1_pdf, x2_pdf), max(x1_pdf, x2_pdf)
+                y1_pdf, y2_pdf = min(y1_pdf, y2_pdf), max(y1_pdf, y2_pdf)
+                
+                # Add small delta if zero area
+                if x1_pdf == x2_pdf:
+                    x2_pdf += 1.0
+                if y1_pdf == y2_pdf:
+                    y2_pdf += 1.0
+                
                 converted_region = region.copy()
                 converted_region["coordinate_block"] = [
                     round(x1_pdf, 2), 
@@ -227,7 +238,7 @@ def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1
     Convert Vector API output to Filter API expected format
     
     Vector API returns: {"pages": [...], "summary": {...}, "metadata": {...}}
-    Filter API expects: {"page_number": 1, "pages": [...]}
+    Filter API expects: {"page_number": int, "pages": [{"page_size": {...}, "lines": [...], "texts": [...], "symbols": [...]}]}
     """
     try:
         logger.info("=== Converting Vector Data to Filter Format ===")
@@ -246,7 +257,10 @@ def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1
             logger.info(f"Converting page {i + 1}")
             
             # Get page size
-            page_size = page.get("page_size", {"width": 595.0, "height": 842.0})
+            page_size = page.get("page_size", {"width": 3370.0, "height": 2384.0})
+            if not all(isinstance(page_size.get(k, 0), (int, float)) for k in ['width', 'height']):
+                logger.warning(f"Invalid page_size for page {i + 1}, using default")
+                page_size = {"width": 3370.0, "height": 2384.0}
             logger.info(f"  Page size: {page_size}")
             
             # Extract drawings data and convert to lines/texts/symbols
@@ -257,70 +271,78 @@ def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1
             lines = []
             vector_lines = drawings.get("lines", [])
             for line in vector_lines:
-                # Ensure proper structure for line points
-                start = line.get("start", [0.0, 0.0])
-                end = line.get("end", [0.0, 0.0])
-                
-                # Validate points are lists with 2 elements
-                if not isinstance(start, list) or len(start) != 2:
-                    logger.warning(f"Invalid start point: {start}, skipping line")
+                try:
+                    # Ensure proper structure for line points
+                    start = line.get("start", [0.0, 0.0])
+                    end = line.get("end", [0.0, 0.0])
+                    
+                    # Validate points are lists with 2 elements
+                    if not isinstance(start, list) or len(start) != 2:
+                        logger.warning(f"Invalid start point: {start}, skipping line")
+                        continue
+                    if not isinstance(end, list) or len(end) != 2:
+                        logger.warning(f"Invalid end point: {end}, skipping line")
+                        continue
+                    
+                    # Ensure numeric values
+                    if not all(isinstance(x, (int, float)) for x in start + end):
+                        logger.warning(f"Non-numeric coordinates in line: start={start}, end={end}, skipping")
+                        continue
+                    
+                    converted_line = {
+                        "p1": [float(start[0]), float(start[1])],
+                        "p2": [float(end[0]), float(end[1])],
+                        "stroke_width": float(line.get("stroke_width", 1.0)),
+                        "length": float(line.get("length", 0.0)),
+                        "color": line.get("color", [0, 0, 0]),
+                        "is_dashed": bool(line.get("is_dashed", False)),
+                        "angle": float(line.get("angle")) if line.get("angle") is not None else None
+                    }
+                    lines.append(converted_line)
+                except Exception as e:
+                    logger.warning(f"Error converting line: {e}, data: {line}")
                     continue
-                if not isinstance(end, list) or len(end) != 2:
-                    logger.warning(f"Invalid end point: {end}, skipping line")
-                    continue
-                
-                converted_line = {
-                    "p1": [float(start[0]), float(start[1])],
-                    "p2": [float(end[0]), float(end[1])],
-                    "stroke_width": float(line.get("stroke_width", 1.0)),
-                    "length": float(line.get("length", 0.0)),
-                    "color": line.get("color", [0, 0, 0]),
-                    "is_dashed": bool(line.get("is_dashed", False)),
-                    "angle": float(line.get("angle")) if line.get("angle") is not None else None
-                }
-                lines.append(converted_line)
             
             logger.info(f"  Converted {len(lines)} lines")
             
-            # Convert texts - FIXED VERSION that handles dict positions
+            # Convert texts
             converted_texts = []
             for text in texts:
                 try:
                     # Get text content
                     text_content = text.get("text", "")
-                    if not text_content:
-                        logger.warning("Empty text content, skipping")
+                    if not text_content or not isinstance(text_content, str):
+                        logger.warning(f"Invalid or empty text content: {text_content}, skipping")
                         continue
                     
-                    # Get position - handle both dict format and list format
+                    # Get position - handle both dict and list format
                     position = text.get("position")
-                    if not position:
-                        # Try to derive from bounding box if position is missing
-                        bbox = text.get("bounding_box", [])
-                        if len(bbox) >= 4:
-                            position = [bbox[0], bbox[1]]
-                        else:
-                            logger.warning(f"No position for text '{text_content}', skipping")
-                            continue
-                    
-                    # Convert dict position to list
                     if isinstance(position, dict):
                         x = position.get("x", 0.0)
                         y = position.get("y", 0.0)
+                        if not all(isinstance(v, (int, float)) for v in [x, y]):
+                            logger.warning(f"Non-numeric position values: {position}, skipping")
+                            continue
                         position = [float(x), float(y)]
-                    elif isinstance(position, list):
-                        if len(position) != 2:
-                            logger.warning(f"Invalid position length for text '{text_content}': {len(position)}")
+                    elif isinstance(position, list) and len(position) == 2:
+                        if not all(isinstance(v, (int, float)) for v in position):
+                            logger.warning(f"Non-numeric position values: {position}, skipping")
                             continue
                         position = [float(position[0]), float(position[1])]
                     else:
-                        logger.warning(f"Invalid position type for text '{text_content}': {type(position)}")
-                        continue
+                        # Fallback: derive from bounding box
+                        bbox = text.get("bounding_box", [])
+                        if len(bbox) == 4 and all(isinstance(v, (int, float)) for v in bbox):
+                            position = [float(bbox[0]), float(bbox[1])]
+                            logger.debug(f"Derived position from bbox for text '{text_content}'")
+                        else:
+                            logger.warning(f"Invalid position and no valid bbox for text '{text_content}': {position}, {bbox}, skipping")
+                            continue
                     
                     # Get bounding box
                     bbox = text.get("bounding_box", [])
-                    if not bbox or len(bbox) != 4:
-                        # Create a default bounding box if missing
+                    if not isinstance(bbox, list) or len(bbox) != 4:
+                        # Create default bounding box based on position
                         font_size = float(text.get("font_size", 12.0))
                         text_width = len(text_content) * font_size * 0.6  # Rough estimate
                         text_height = font_size * 1.2
@@ -330,38 +352,36 @@ def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1
                             float(position[0]) + text_width,
                             float(position[1]) + text_height
                         ]
-                        logger.debug(f"Created default bbox for text '{text_content}'")
+                        logger.debug(f"Created default bbox for text '{text_content}': {bbox}")
                     
-                    # Validate bounding box
-                    if len(bbox) != 4:
-                        logger.warning(f"Invalid bbox length for text '{text_content}': {len(bbox)}")
+                    # Ensure numeric values
+                    if not all(isinstance(v, (int, float)) for v in bbox):
+                        logger.warning(f"Non-numeric bbox values for text '{text_content}': {bbox}, skipping")
                         continue
                     
-                    # Ensure bbox values are floats and properly ordered
-                    bbox = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
+                    # Convert to floats and ensure correct order
+                    bbox = [float(v) for v in bbox]
+                    x0, y0, x1, y1 = bbox
+                    x0, x1 = min(x0, x1), max(x0, x1)
+                    y0, y1 = min(y0, y1), max(y0, y1)
                     
-                    # Fix bbox if coordinates are reversed
-                    if bbox[0] > bbox[2]:
-                        bbox[0], bbox[2] = bbox[2], bbox[0]
-                    if bbox[1] > bbox[3]:
-                        bbox[1], bbox[3] = bbox[3], bbox[1]
-                    
-                    # Ensure bbox has some area
-                    if bbox[0] == bbox[2]:
-                        bbox[2] = bbox[0] + 10.0
-                    if bbox[1] == bbox[3]:
-                        bbox[3] = bbox[1] + 10.0
+                    # Add small delta if zero area
+                    if x0 == x1:
+                        x1 += 1.0
+                    if y0 == y1:
+                        y1 += 1.0
+                    bbox = [x0, y0, x1, y1]
                     
                     converted_text = {
                         "text": str(text_content),
-                        "position": position,  # Now guaranteed to be [float, float]
+                        "position": position,
                         "font_size": float(text.get("font_size", 12.0)),
                         "bounding_box": bbox
                     }
                     converted_texts.append(converted_text)
                     
                 except Exception as e:
-                    logger.error(f"Error converting text: {e}, text data: {text}")
+                    logger.warning(f"Error converting text: {e}, text data: {text}")
                     continue
             
             logger.info(f"  Converted {len(converted_texts)} texts")
@@ -373,18 +393,41 @@ def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1
                 for shape in shapes:
                     try:
                         bbox = shape.get("bounding_box", [])
-                        if not bbox or len(bbox) != 4:
-                            logger.warning(f"Invalid bbox for {shape_type}, skipping")
+                        if not isinstance(bbox, list) or len(bbox) != 4:
+                            # Create default bounding box from points if available
+                            points = shape.get("points", [])
+                            if points and all(isinstance(p, list) and len(p) == 2 for p in points):
+                                xs = [float(p[0]) for p in points]
+                                ys = [float(p[1]) for p in points]
+                                x0, x1 = min(xs), max(xs)
+                                y0, y1 = min(ys), max(ys)
+                                if x0 == x1:
+                                    x1 += 1.0
+                                if y0 == y1:
+                                    y1 += 1.0
+                                bbox = [x0, y0, x1, y1]
+                                logger.debug(f"Created default bbox for {shape_type} from points: {bbox}")
+                            else:
+                                logger.warning(f"Invalid bbox and no valid points for {shape_type}: {bbox}, {points}, skipping")
+                                continue
+                        
+                        # Ensure numeric values
+                        if not all(isinstance(v, (int, float)) for v in bbox):
+                            logger.warning(f"Non-numeric bbox values for {shape_type}: {bbox}, skipping")
                             continue
                         
-                        # Ensure bbox values are floats and properly ordered
-                        bbox = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
+                        # Convert to floats and ensure correct order
+                        bbox = [float(v) for v in bbox]
+                        x0, y0, x1, y1 = bbox
+                        x0, x1 = min(x0, x1), max(x0, x1)
+                        y0, y1 = min(y0, y1), max(y0, y1)
                         
-                        # Fix bbox if coordinates are reversed
-                        if bbox[0] > bbox[2]:
-                            bbox[0], bbox[2] = bbox[2], bbox[0]
-                        if bbox[1] > bbox[3]:
-                            bbox[1], bbox[3] = bbox[3], bbox[1]
+                        # Add small delta if zero area
+                        if x0 == x1:
+                            x1 += 1.0
+                        if y0 == y1:
+                            y1 += 1.0
+                        bbox = [x0, y0, x1, y1]
                         
                         symbol = {
                             "type": shape_type.rstrip('s'),  # "rectangles" -> "rectangle"
@@ -393,7 +436,7 @@ def convert_vector_data_to_filter_format(vector_data: Dict, page_number: int = 1
                         }
                         symbols.append(symbol)
                     except Exception as e:
-                        logger.error(f"Error converting symbol: {e}, shape data: {shape}")
+                        logger.warning(f"Error converting symbol: {e}, shape data: {shape}")
                         continue
             
             logger.info(f"  Converted {len(symbols)} symbols")
@@ -496,7 +539,7 @@ async def process_pdf(
     Process PDF workflow with correct JSON structure for Filter API
     """
     try:
-        logger.info(f"=== Starting PDF Processing v1.5.0 ===")
+        logger.info(f"=== Starting PDF Processing v1.5.1 ===")
         logger.info(f"Received file: {file.filename}")
         logger.info(f"Output format: {output_format}")
         
@@ -549,7 +592,7 @@ async def process_pdf(
         logger.info("=== Extracting PDF Page Dimensions ===")
         
         first_page = vector_data['pages'][0]
-        pdf_page_size = first_page.get('page_size', {"width": 595.0, "height": 842.0})
+        pdf_page_size = first_page.get('page_size', {"width": 3370.0, "height": 2384.0})
         logger.info(f"PDF page size: {pdf_page_size}")
 
         # Step 5: Convert vision coordinates to PDF coordinates
@@ -564,8 +607,8 @@ async def process_pdf(
         logger.info("=== Preparing Filter API Request ===")
         
         filter_request_data = {
-            "vector_data": filter_vector_data,  # ✅ Correct key name
-            "vision_output": converted_vision   # ✅ Correct structure
+            "vector_data": filter_vector_data,
+            "vision_output": converted_vision
         }
         
         logger.info("Filter API request structure:")
@@ -582,7 +625,7 @@ async def process_pdf(
             
             filter_response = requests.post(
                 PRE_FILTER_API_URL,
-                json=filter_request_data,  # ✅ Sending correct JSON structure
+                json=filter_request_data,
                 headers=headers,
                 timeout=300
             )
@@ -599,7 +642,14 @@ async def process_pdf(
                     "vector_data": vector_data,
                     "vision_data": converted_vision,
                     "filter_error": filter_response.text,
-                    "timestamp": time.strftime("%Y-%m-%d")
+                    "timestamp": time.strftime("%Y-%m-%d"),
+                    "processing_stats": {
+                        "pdf_page_size": pdf_page_size,
+                        "regions_converted": len(converted_vision.get('regions', [])),
+                        "coordinate_conversion": "applied",
+                        "json_structure": "corrected_for_filter_api",
+                        "version": "1.5.1"
+                    }
                 }
             else:
                 # Parse successful response
@@ -620,7 +670,7 @@ async def process_pdf(
                         "regions_converted": len(converted_vision.get('regions', [])),
                         "coordinate_conversion": "applied",
                         "json_structure": "corrected_for_filter_api",
-                        "version": "1.5.0"
+                        "version": "1.5.1"
                     },
                     "timestamp": time.strftime("%Y-%m-%d")
                 }
@@ -640,7 +690,14 @@ async def process_pdf(
                 "vector_data": vector_data,
                 "vision_data": converted_vision,
                 "error": f"Pre-Filter API error: {str(e)}",
-                "timestamp": time.strftime("%Y-%m-%d")
+                "timestamp": time.strftime("%Y-%m-%d"),
+                "processing_stats": {
+                    "pdf_page_size": pdf_page_size,
+                    "regions_converted": len(converted_vision.get('regions', [])),
+                    "coordinate_conversion": "applied",
+                    "json_structure": "corrected_for_filter_api",
+                    "version": "1.5.1"
+                }
             }
             
             if output_format == "txt":
@@ -660,7 +717,7 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "version": "1.5.0",
+        "version": "1.5.1",
         "features": [
             "PDF upload and processing",
             "Vision output parsing",
@@ -674,11 +731,12 @@ async def health():
             "Minified text output option"
         ],
         "fixes": [
-            "Fixed text position validation for dict format",
-            "Converts {x:, y:} positions to [x, y] format",
-            "Fixed bounding box validation and ordering",
-            "Added default bounding box creation",
-            "Added proper error handling for invalid data"
+            "Fixed text position conversion from dict to list",
+            "Repairs invalid bounding boxes for texts and symbols",
+            "Handles missing position with bbox fallback",
+            "Repairs zero-area bounding boxes",
+            "Preserves all valid texts and symbols",
+            "Detailed logging for skipped elements"
         ]
     }
 
@@ -687,7 +745,7 @@ async def root():
     """Root endpoint with API information"""
     return {
         "title": "Master API",
-        "version": "1.5.0",
+        "version": "1.5.1",
         "description": "Processes PDF with correct JSON structure for Filter API",
         "workflow": [
             "1. Receive PDF file and vision_output",
@@ -699,8 +757,8 @@ async def root():
             "7. Return combined results (JSON or minified TXT)"
         ],
         "json_structure_fix": {
-            "problem": "Master API was sending invalid text positions (dict format instead of list)",
-            "solution": "Converts {'x': val, 'y': val} to [x, y] format for Filter API",
+            "problem": "Master API was sending invalid text positions (dict format instead of list) and losing texts/symbols",
+            "solution": "Converts {'x': val, 'y': val} to [x, y], repairs invalid bounding boxes, preserves all valid data",
             "filter_api_expects": {
                 "vector_data": {
                     "page_number": 1, 
@@ -717,7 +775,7 @@ async def root():
                         }],
                         "texts": [{
                             "text": "string",
-                            "position": "[float, float]",  # NOT {"x": float, "y": float}
+                            "position": "[float, float]",
                             "font_size": "float",
                             "bounding_box": "[x0, y0, x2, y3] where x0 < x2 and y0 < y3"
                         }],
@@ -739,6 +797,6 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting Master API v1.5.0 on port {PORT}")
-    logger.info("New: Fixed dict to list position conversion for texts")
+    logger.info(f"Starting Master API v1.5.1 on port {PORT}")
+    logger.info("New: Fixed text position conversion, bounding box repairs, and preserved all valid texts/symbols")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
