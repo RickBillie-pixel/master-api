@@ -1,7 +1,6 @@
 import os
 import tempfile
 import uuid
-import math
 from fastapi import FastAPI, UploadFile, HTTPException, Form, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
@@ -19,8 +18,8 @@ logger = logging.getLogger(__name__)
 PORT = int(os.environ.get("PORT", 10000))
 
 app = FastAPI(
-    title="Clean Master API",
-    description="Processes PDF and returns clean, focused output per region",
+    title="Simple Master API",
+    description="Processes PDF with Vector Drawing API and Filter API - no conversion issues",
     version="3.0.0"
 )
 
@@ -34,7 +33,7 @@ app.add_middleware(
 )
 
 VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
-FILTER_API_URL = "https://your-clean-filter-api.onrender.com/filter/"  # Update this URL
+FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/filter-from-vector-api/"  # Use the direct endpoint
 
 MAX_RETRIES = 3
 
@@ -50,7 +49,7 @@ async def call_vector_api_with_retry(file_content: bytes, filename: str, params:
             
             files = {'file': (filename, file_content, 'application/pdf')}
             headers = {
-                'User-Agent': 'Clean-Master-API/3.0.0',
+                'User-Agent': 'Simple-Master-API/3.0.0',
                 'Accept': 'application/json',
                 'Connection': 'close'
             }
@@ -137,192 +136,22 @@ def convert_vision_coordinates_to_pdf(vision_data: Dict, pdf_page_size: Dict) ->
         logger.error(f"Error converting coordinates: {e}")
         return vision_data
 
-def convert_vector_data_to_filter_format(vector_data: Dict) -> Dict:
-    """Convert Vector API output to Filter API expected format"""
-    try:
-        logger.info("=== DEBUG: Vector Data Structure Analysis ===")
-        
-        pages = vector_data.get("pages", [])
-        if not pages:
-            raise ValueError("No pages found in vector data")
-        
-        page = pages[0]
-        page_size = page.get("page_size", {"width": 595.0, "height": 842.0})
-        
-        # Log the actual structure to understand what we're getting
-        logger.info(f"Page keys: {list(page.keys())}")
-        
-        # Try to find the correct structure
-        texts = []
-        lines = []
-        
-        # Check for texts in multiple possible locations
-        if "texts" in page:
-            texts = page["texts"]
-            logger.info(f"Found {len(texts)} texts in page['texts']")
-        
-        # Check for drawings/lines in multiple possible locations
-        drawings = page.get("drawings", {})
-        if drawings:
-            logger.info(f"Drawings keys: {list(drawings.keys())}")
-            
-            # Check for lines in drawings
-            if "lines" in drawings:
-                raw_lines = drawings["lines"]
-                logger.info(f"Found {len(raw_lines)} lines in drawings['lines']")
-                
-                # Log first few lines to see structure
-                for i, line in enumerate(raw_lines[:3]):
-                    logger.info(f"Sample line {i}: {line}")
-                
-                # Convert lines based on actual structure
-                for line in raw_lines:
-                    try:
-                        # Check different possible field names for coordinates
-                        start_point = None
-                        end_point = None
-                        
-                        # Try different field names
-                        if "p1" in line and "p2" in line:
-                            start_point = line["p1"]
-                            end_point = line["p2"]
-                        elif "start" in line and "end" in line:
-                            start_point = line["start"]
-                            end_point = line["end"]
-                        elif "type" in line and line["type"] == "line":
-                            # For your Vector API format
-                            start_point = line.get("p1", [0.0, 0.0])
-                            end_point = line.get("p2", [0.0, 0.0])
-                        
-                        # Convert points to [x, y] format
-                        if start_point and end_point:
-                            # Handle different point formats
-                            if isinstance(start_point, dict):
-                                start = [float(start_point.get("x", 0)), float(start_point.get("y", 0))]
-                            elif isinstance(start_point, list) and len(start_point) >= 2:
-                                start = [float(start_point[0]), float(start_point[1])]
-                            else:
-                                start = [0.0, 0.0]
-                            
-                            if isinstance(end_point, dict):
-                                end = [float(end_point.get("x", 0)), float(end_point.get("y", 0))]
-                            elif isinstance(end_point, list) and len(end_point) >= 2:
-                                end = [float(end_point[0]), float(end_point[1])]
-                            else:
-                                end = [0.0, 0.0]
-                            
-                            # Calculate length if not provided
-                            length = line.get("length", 0.0)
-                            if length == 0.0:
-                                length = math.sqrt((end[0] - start[0])**2 + (end[1] - start[1])**2)
-                            
-                            converted_line = {
-                                "p1": start,
-                                "p2": end,
-                                "stroke_width": float(line.get("width", line.get("stroke_width", 1.0))),
-                                "length": float(length),
-                                "color": line.get("color", [0, 0, 0]),
-                                "is_dashed": bool(line.get("is_dashed", False)),
-                                "angle": float(line.get("angle")) if line.get("angle") is not None else None
-                            }
-                            lines.append(converted_line)
-                            
-                            # Log successful conversion
-                            if len(lines) <= 3:
-                                logger.info(f"Converted line {len(lines)}: {start} -> {end}, length: {length}")
-                        
-                    except Exception as e:
-                        logger.warning(f"Error converting line: {e}")
-                        continue
-        
-        # Convert texts
-        converted_texts = []
-        for text in texts:
-            try:
-                text_content = text.get("text", "")
-                if not text_content:
-                    continue
-                
-                position = text.get("position")
-                if isinstance(position, dict):
-                    position = [float(position.get("x", 0)), float(position.get("y", 0))]
-                elif isinstance(position, list) and len(position) == 2:
-                    position = [float(position[0]), float(position[1])]
-                else:
-                    bbox = text.get("bbox", text.get("bounding_box", [0, 0, 100, 20]))
-                    if isinstance(bbox, dict):
-                        position = [float(bbox.get("x0", 0)), float(bbox.get("y0", 0))]
-                    else:
-                        position = [float(bbox[0]), float(bbox[1])]
-                
-                bbox = text.get("bbox", text.get("bounding_box", []))
-                if isinstance(bbox, dict):
-                    bbox = [bbox.get("x0", 0), bbox.get("y0", 0), bbox.get("x1", 100), bbox.get("y1", 20)]
-                elif len(bbox) != 4:
-                    font_size = float(text.get("font_size", 12.0))
-                    text_width = len(text_content) * font_size * 0.6
-                    text_height = font_size * 1.2
-                    bbox = [
-                        position[0],
-                        position[1],
-                        position[0] + text_width,
-                        position[1] + text_height
-                    ]
-                
-                converted_text = {
-                    "text": str(text_content),
-                    "position": position,
-                    "font_size": float(text.get("font_size", 12.0)),
-                    "bounding_box": [float(x) for x in bbox]
-                }
-                converted_texts.append(converted_text)
-                
-            except Exception as e:
-                logger.warning(f"Error converting text: {e}")
-                continue
-        
-        filter_data = {
-            "page_number": 1,
-            "pages": [{
-                "page_size": page_size,
-                "lines": lines,
-                "texts": converted_texts
-            }]
-        }
-        
-        logger.info(f"✅ Converted: {len(lines)} lines, {len(converted_texts)} texts")
-        
-        if len(lines) == 0:
-            logger.error("⚠️ NO LINES CONVERTED! Check Vector API response structure")
-        elif len(lines) > 0:
-            sample_line = lines[0]
-            logger.info(f"Sample converted line: {sample_line['p1']} -> {sample_line['p2']}")
-        
-        return filter_data
-        
-    except Exception as e:
-        logger.error(f"Error converting vector data: {e}")
-        raise ValueError(f"Failed to convert vector data: {str(e)}")
-
 @app.post("/process/")
-async def process_pdf_clean(
+async def process_pdf_simple(
     file: UploadFile = File(...),
     vision_output: str = Form(...),
     output_format: str = Form(default="json"),
     debug: bool = Form(default=False)
 ):
-    """Process PDF and return clean, focused output per region"""
+    """SIMPLE process - direct pass Vector API data to Filter API"""
     try:
-        logger.info(f"=== Starting Clean PDF Processing v3.0.0 ===")
+        logger.info(f"=== Starting SIMPLE PDF Processing ===")
         logger.info(f"File: {file.filename}, Debug: {debug}")
         
         # Read file
         file_content = await file.read()
         if not file_content:
             raise HTTPException(status_code=400, detail="Empty file received")
-        
-        file_size_mb = len(file_content) / (1024 * 1024)
-        logger.info(f"File size: {file_size_mb:.2f} MB")
         
         # Parse vision output
         try:
@@ -336,7 +165,8 @@ async def process_pdf_clean(
         logger.info("=== Calling Vector API ===")
         
         params = {
-            'minify': 'true',
+            'minify': 'false',  # Non-minified for easier processing
+            'remove_non_essential': 'false',
             'precision': '1'
         }
         
@@ -347,7 +177,6 @@ async def process_pdf_clean(
             vector_data = json.loads(vector_response.text)
             if isinstance(vector_data, str):
                 vector_data = json.loads(vector_data)
-                
         except Exception as e:
             logger.error(f"Vector API parsing error: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to parse Vector API response")
@@ -359,45 +188,19 @@ async def process_pdf_clean(
         pdf_page_size = first_page.get('page_size', {"width": 595.0, "height": 842.0})
         converted_vision = convert_vision_coordinates_to_pdf(vision_data, pdf_page_size)
 
-        # Convert vector data
-        logger.info("=== Converting Vector Data ===")
-        filter_vector_data = convert_vector_data_to_filter_format(vector_data)
-
-        # Prepare Filter API request
-        filter_request = {
-            "vector_data": filter_vector_data,
-            "vision_output": converted_vision
-        }
-
-        # Call Clean Filter API with debug if requested
-        logger.info("=== Calling Clean Filter API ===")
+        # Call Filter API DIRECTLY with Vector API data (no conversion!)
+        logger.info("=== Calling Filter API Directly ===")
         
         try:
-            debug_data = None
-            if debug:
-                # First call debug endpoint
-                debug_response = requests.post(
-                    FILTER_API_URL.replace('/filter/', '/debug/'),
-                    json=filter_request,
-                    headers={'Content-Type': 'application/json'},
-                    timeout=300
-                )
-                
-                if debug_response.status_code == 200:
-                    debug_data = debug_response.json()
-                    logger.info("=== DEBUG INFO ===")
-                    logger.info(f"Total lines: {debug_data.get('total_lines')}")
-                    logger.info(f"Coordinate range: {debug_data.get('coordinate_analysis')}")
-                    for region_debug in debug_data.get('regions', []):
-                        logger.info(f"Region {region_debug['label']}: {region_debug['lines_in_region']} lines in region, {region_debug['lines_included']} included")
-                else:
-                    logger.warning("Debug endpoint failed")
-            
-            # Main filter call with debug parameter
             filter_url = f"{FILTER_API_URL}?debug={str(debug).lower()}"
+            filter_data = {
+                "vector_data": vector_data,  # Pass raw Vector API data!
+                "vision_output": converted_vision
+            }
+            
             filter_response = requests.post(
                 filter_url,
-                json=filter_request,
+                json=filter_data,
                 headers={'Content-Type': 'application/json'},
                 timeout=300
             )
@@ -407,48 +210,43 @@ async def process_pdf_clean(
                 raise HTTPException(status_code=500, detail="Filter API failed")
             
             filtered_data = filter_response.json()
-            logger.info("✅ Clean filtering successful")
+            logger.info("✅ Filter API call successful")
             
             # Create final result
             result = {
                 "status": "success",
                 "data": filtered_data,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "processing_info": {
+                    "vector_api_lines": len(vector_data.get('pages', [{}])[0].get('drawings', {}).get('lines', [])),
+                    "vector_api_texts": len(vector_data.get('pages', [{}])[0].get('texts', [])),
+                    "filtered_regions": len(filtered_data.get('regions', [])),
+                    "total_filtered_lines": sum(len(r.get('lines', [])) for r in filtered_data.get('regions', [])),
+                    "total_filtered_texts": sum(len(r.get('texts', [])) for r in filtered_data.get('regions', []))
+                }
             }
             
-            if debug and debug_data:
-                result["debug_info"] = debug_data
-            
             # Log summary
-            total_lines = sum(len(r.get('lines', [])) for r in filtered_data.get('regions', []))
-            total_texts = sum(len(r.get('texts', [])) for r in filtered_data.get('regions', []))
-            
             logger.info(f"✅ Final result:")
             logger.info(f"  Drawing type: {filtered_data.get('drawing_type')}")
             logger.info(f"  Regions: {len(filtered_data.get('regions', []))}")
-            logger.info(f"  Total lines: {total_lines}")
-            logger.info(f"  Total texts: {total_texts}")
-            
-            if total_lines == 0:
-                logger.warning("⚠️  WARNING: No lines in output! Check coordinate conversion or filtering logic.")
+            logger.info(f"  Total lines: {result['processing_info']['total_filtered_lines']}")
+            logger.info(f"  Total texts: {result['processing_info']['total_filtered_texts']}")
             
             # Return appropriate format
             if output_format == "txt":
-                summary = f"""=== CLEAN PDF PROCESSING RESULT ===
+                summary = f"""=== SIMPLE PDF PROCESSING RESULT ===
 Status: {result['status']}
 Drawing Type: {filtered_data.get('drawing_type')}
 Regions: {len(filtered_data.get('regions', []))}
-Total Lines: {total_lines}
-Total Texts: {total_texts}
+Total Lines: {result['processing_info']['total_filtered_lines']}
+Total Texts: {result['processing_info']['total_filtered_texts']}
 Timestamp: {result['timestamp']}
 
 REGIONS:
 """
                 for region in filtered_data.get('regions', []):
                     summary += f"- {region.get('label')}: {len(region.get('lines', []))} lines, {len(region.get('texts', []))} texts\n"
-                
-                if total_lines == 0:
-                    summary += "\n⚠️  WARNING: No lines found! Check coordinate system or filtering logic.\n"
                 
                 return PlainTextResponse(content=summary)
             else:
@@ -464,129 +262,63 @@ REGIONS:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@app.post("/debug/")
-async def debug_pdf_processing(
-    file: UploadFile = File(...),
-    vision_output: str = Form(...)
-):
-    """Debug endpoint to diagnose processing issues"""
-    try:
-        logger.info("=== Debug PDF Processing ===")
-        
-        # Read file
-        file_content = await file.read()
-        file_size_mb = len(file_content) / (1024 * 1024)
-        
-        # Parse vision output
-        vision_data = json.loads(vision_output)
-        
-        # Call Vector API
-        params = {'minify': 'true', 'precision': '1'}
-        vector_response = await call_vector_api_with_retry(file_content, file.filename, params)
-        vector_data = json.loads(vector_response.text)
-        
-        # Convert coordinates
-        first_page = vector_data['pages'][0]
-        pdf_page_size = first_page.get('page_size', {"width": 595.0, "height": 842.0})
-        converted_vision = convert_vision_coordinates_to_pdf(vision_data, pdf_page_size)
-        
-        # Convert vector data
-        filter_vector_data = convert_vector_data_to_filter_format(vector_data)
-        
-        # Call debug endpoint
-        filter_request = {
-            "vector_data": filter_vector_data,
-            "vision_output": converted_vision
-        }
-        
-        debug_response = requests.post(
-            FILTER_API_URL.replace('/filter/', '/debug/'),
-            json=filter_request,
-            headers={'Content-Type': 'application/json'},
-            timeout=300
-        )
-        
-        debug_data = debug_response.json() if debug_response.status_code == 200 else {"error": debug_response.text}
-        
-        return {
-            "file_info": {
-                "filename": file.filename,
-                "size_mb": round(file_size_mb, 2)
-            },
-            "pdf_page_size": pdf_page_size,
-            "vision_regions": len(vision_data.get('regions', [])),
-            "converted_regions": [
-                {
-                    "label": r.get('label'),
-                    "original_bounds": vision_data['regions'][i]['coordinate_block'],
-                    "converted_bounds": r.get('coordinate_block')
-                }
-                for i, r in enumerate(converted_vision.get('regions', []))
-            ],
-            "vector_data_info": {
-                "total_lines": len(filter_vector_data['pages'][0]['lines']),
-                "total_texts": len(filter_vector_data['pages'][0]['texts'])
-            },
-            "filter_debug": debug_data
-        }
-        
-    except Exception as e:
-        logger.error(f"Debug error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
-
 @app.get("/health/")
 async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
         "version": "3.0.0",
-        "description": "Clean Master API - focused output per region"
+        "description": "Simple Master API - no data conversion issues"
     }
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Clean Master API",
+        "title": "Simple Master API",
         "version": "3.0.0",
-        "description": "Processes PDF and returns clean, focused output per region",
+        "description": "Processes PDF with Vector Drawing API and Filter API - no conversion issues",
         "workflow": [
-            "1. Receive PDF and vision_output",
-            "2. Call Vector Drawing API",
-            "3. Convert coordinates to PDF space",
-            "4. Call Clean Filter API",
-            "5. Return focused data per region only"
+            "1. Receive PDF file and vision_output (region coordinates)",
+            "2. Call Vector Drawing API to extract lines and texts", 
+            "3. Convert vision coordinates from image pixels to PDF points",
+            "4. Call Filter API directly with raw Vector API data",
+            "5. Return filtered data per region"
         ],
+        "filter_system_explanation": {
+            "overview": "Filter API processes lines and texts per region with length-based filtering",
+            "steps": [
+                "1. Convert Vector API format ({p1: {x,y}, p2: {x,y}}) to internal format",
+                "2. For each region, check which lines intersect with region boundaries", 
+                "3. Apply length filtering based on drawing type (plattegrond > 50pt)",
+                "4. Return only lines and texts that belong to each region"
+            ],
+            "intersection_logic": [
+                "Method 1: Check if line endpoints are inside region",
+                "Method 2: Check if line spans across region boundaries", 
+                "Method 3: Use Shapely geometric intersection as fallback"
+            ],
+            "length_filters": {
+                "plattegrond": "Lines longer than 50 points",
+                "gevelaanzicht": "Lines longer than 40 points", 
+                "detailtekening": "Lines longer than 25 points",
+                "doorsnede": "Vertical lines > 30pts OR dashed lines",
+                "installatietekening": "Thin lines (≤1pt) OR dashed lines"
+            }
+        },
         "key_improvements": [
-            "No unassigned data",
-            "No unnecessary metadata", 
-            "Clean per-region structure",
-            "Precise line data with midpoints",
-            "Text with bounding boxes preserved",
-            "Correct length filtering per drawing type (plattegrond > 50pt)",
-            "Debug mode for troubleshooting"
+            "No data conversion errors - uses Vector API format directly",
+            "Accurate region-based filtering with geometric intersection",
+            "Length-based line filtering per drawing type",
+            "Clean output structure per region only"
         ],
         "endpoints": {
             "/process/": "Main processing endpoint",
-            "/debug/": "Debug coordinate conversion and filtering",
-            "/process/?debug=true": "Process with debug logging"
-        },
-        "output_structure": {
-            "status": "success",
-            "data": {
-                "drawing_type": "plattegrond",
-                "regions": [
-                    {
-                        "label": "region_name",
-                        "lines": "array of clean line objects",
-                        "texts": "array of clean text objects"
-                    }
-                ]
-            }
+            "/health/": "Health check"
         }
     }
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting Clean Master API v3.0.0 on port {PORT}")
+    logger.info(f"Starting Simple Master API v3.0.0 on port {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
