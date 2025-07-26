@@ -18,9 +18,9 @@ logger = logging.getLogger(__name__)
 PORT = int(os.environ.get("PORT", 10000))
 
 app = FastAPI(
-    title="Simple Master API",
-    description="Processes PDF with Vector Drawing API and Filter API - no conversion issues",
-    version="3.0.0"
+    title="Master API with Scale Integration",
+    description="Processes PDF with Vector Drawing API, Filter API, and Scale API",
+    version="4.0.0"
 )
 
 # CORS middleware
@@ -33,7 +33,8 @@ app.add_middleware(
 )
 
 VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
-FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/filter-from-vector-api/"  # Use the direct endpoint
+FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/filter-from-vector-api/"
+SCALE_API_URL = "https://scale-api.onrender.com/calculate-scale/"  # Update with your Scale API URL
 
 MAX_RETRIES = 3
 
@@ -49,7 +50,7 @@ async def call_vector_api_with_retry(file_content: bytes, filename: str, params:
             
             files = {'file': (filename, file_content, 'application/pdf')}
             headers = {
-                'User-Agent': 'Simple-Master-API/3.0.0',
+                'User-Agent': 'Master-API/4.0.0',
                 'Accept': 'application/json',
                 'Connection': 'close'
             }
@@ -136,17 +137,92 @@ def convert_vision_coordinates_to_pdf(vision_data: Dict, pdf_page_size: Dict) ->
         logger.error(f"Error converting coordinates: {e}")
         return vision_data
 
+async def call_filter_api(vector_data: Dict, converted_vision: Dict, debug: bool) -> Dict:
+    """Call Filter API with retry logic"""
+    logger.info("=== Calling Filter API ===")
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            filter_url = f"{FILTER_API_URL}?debug={str(debug).lower()}"
+            filter_data = {
+                "vector_data": vector_data,
+                "vision_output": converted_vision
+            }
+            
+            filter_response = requests.post(
+                filter_url,
+                json=filter_data,
+                headers={'Content-Type': 'application/json'},
+                timeout=300
+            )
+            
+            if filter_response.status_code == 200:
+                logger.info("✅ Filter API call successful")
+                return filter_response.json()
+            else:
+                logger.error(f"❌ Filter API returned {filter_response.status_code}: {filter_response.text}")
+                if attempt == MAX_RETRIES - 1:
+                    raise HTTPException(status_code=500, detail="Filter API failed")
+                    
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Filter API request failed on attempt {attempt + 1}: {e}")
+            if attempt == MAX_RETRIES - 1:
+                raise HTTPException(status_code=500, detail="Filter API connection failed")
+        
+        if attempt < MAX_RETRIES - 1:
+            wait_time = 2 ** attempt + 1
+            logger.info(f"⏳ Waiting {wait_time}s before retry...")
+            await asyncio.sleep(wait_time)
+    
+    raise HTTPException(status_code=500, detail="Filter API failed after all retries")
+
+async def call_scale_api(filtered_data: Dict, debug: bool) -> Dict:
+    """Call Scale API with retry logic"""
+    logger.info("=== Calling Scale API ===")
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            scale_url = f"{SCALE_API_URL}?debug={str(debug).lower()}"
+            
+            scale_response = requests.post(
+                scale_url,
+                json=filtered_data,
+                headers={'Content-Type': 'application/json'},
+                timeout=300
+            )
+            
+            if scale_response.status_code == 200:
+                logger.info("✅ Scale API call successful")
+                return scale_response.json()
+            else:
+                logger.error(f"❌ Scale API returned {scale_response.status_code}: {scale_response.text}")
+                if attempt == MAX_RETRIES - 1:
+                    raise HTTPException(status_code=500, detail="Scale API failed")
+                    
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Scale API request failed on attempt {attempt + 1}: {e}")
+            if attempt == MAX_RETRIES - 1:
+                raise HTTPException(status_code=500, detail="Scale API connection failed")
+        
+        if attempt < MAX_RETRIES - 1:
+            wait_time = 2 ** attempt + 1
+            logger.info(f"⏳ Waiting {wait_time}s before retry...")
+            await asyncio.sleep(wait_time)
+    
+    raise HTTPException(status_code=500, detail="Scale API failed after all retries")
+
 @app.post("/process/")
-async def process_pdf_simple(
+async def process_pdf_with_scale(
     file: UploadFile = File(...),
     vision_output: str = Form(...),
     output_format: str = Form(default="json"),
-    debug: bool = Form(default=False)
+    debug: bool = Form(default=False),
+    minify: bool = Form(default=True)
 ):
-    """SIMPLE process - direct pass Vector API data to Filter API"""
+    """Process PDF with Vector API, Filter API, and Scale API integration"""
     try:
-        logger.info(f"=== Starting SIMPLE PDF Processing ===")
-        logger.info(f"File: {file.filename}, Debug: {debug}")
+        logger.info(f"=== Starting PDF Processing with Scale Integration ===")
+        logger.info(f"File: {file.filename}, Debug: {debug}, Minify: {minify}")
         
         # Read file
         file_content = await file.read()
@@ -165,7 +241,7 @@ async def process_pdf_simple(
         logger.info("=== Calling Vector API ===")
         
         params = {
-            'minify': 'false',  # Non-minified for easier processing
+            'minify': str(minify).lower(),
             'remove_non_essential': 'false',
             'precision': '1'
         }
@@ -188,73 +264,113 @@ async def process_pdf_simple(
         pdf_page_size = first_page.get('page_size', {"width": 595.0, "height": 842.0})
         converted_vision = convert_vision_coordinates_to_pdf(vision_data, pdf_page_size)
 
-        # Call Filter API DIRECTLY with Vector API data (no conversion!)
-        logger.info("=== Calling Filter API Directly ===")
+        # Call Filter API
+        filtered_data = await call_filter_api(vector_data, converted_vision, debug)
         
-        try:
-            filter_url = f"{FILTER_API_URL}?debug={str(debug).lower()}"
-            filter_data = {
-                "vector_data": vector_data,  # Pass raw Vector API data!
-                "vision_output": converted_vision
+        # Call Scale API with filtered data
+        scale_data = await call_scale_api(filtered_data, debug)
+        
+        # Create combined result
+        result = {
+            "status": "success",
+            "filter_output": filtered_data,
+            "scale_output": scale_data,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "processing_info": {
+                "vector_api_lines": len(vector_data.get('pages', [{}])[0].get('drawings', {}).get('lines', [])),
+                "vector_api_texts": len(vector_data.get('pages', [{}])[0].get('texts', [])),
+                "filtered_regions": len(filtered_data.get('regions', [])),
+                "total_filtered_lines": sum(len(r.get('lines', [])) for r in filtered_data.get('regions', [])),
+                "total_filtered_texts": sum(len(r.get('texts', [])) for r in filtered_data.get('regions', [])),
+                "scale_regions": len(scale_data.get('regions', [])),
+                "overall_scale_pt_per_mm": scale_data.get('overall_average_pt_per_mm'),
+                "minified": minify
+            }
+        }
+        
+        # Apply minification if requested
+        if minify:
+            logger.info("Applying minification...")
+            
+            # Minify filter output
+            minified_filter = {
+                "drawing_type": filtered_data.get("drawing_type"),
+                "regions": []
             }
             
-            filter_response = requests.post(
-                filter_url,
-                json=filter_data,
-                headers={'Content-Type': 'application/json'},
-                timeout=300
-            )
-            
-            if filter_response.status_code != 200:
-                logger.error(f"Filter API error: {filter_response.text}")
-                raise HTTPException(status_code=500, detail="Filter API failed")
-            
-            filtered_data = filter_response.json()
-            logger.info("✅ Filter API call successful")
-            
-            # Create final result
-            result = {
-                "status": "success",
-                "data": filtered_data,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "processing_info": {
-                    "vector_api_lines": len(vector_data.get('pages', [{}])[0].get('drawings', {}).get('lines', [])),
-                    "vector_api_texts": len(vector_data.get('pages', [{}])[0].get('texts', [])),
-                    "filtered_regions": len(filtered_data.get('regions', [])),
-                    "total_filtered_lines": sum(len(r.get('lines', [])) for r in filtered_data.get('regions', [])),
-                    "total_filtered_texts": sum(len(r.get('texts', [])) for r in filtered_data.get('regions', []))
+            for region in filtered_data.get("regions", []):
+                minified_region = {
+                    "label": region.get("label"),
+                    "lines": [
+                        {
+                            "length": line.get("length"),
+                            "orientation": line.get("orientation"),
+                            "midpoint": line.get("midpoint")
+                        } for line in region.get("lines", [])
+                    ],
+                    "texts": [
+                        {
+                            "text": text.get("text"),
+                            "midpoint": text.get("midpoint"),
+                            "orientation": text.get("orientation")
+                        } for text in region.get("texts", [])
+                    ]
                 }
+                minified_filter["regions"].append(minified_region)
+            
+            # Minify scale output
+            minified_scale = {
+                "drawing_type": scale_data.get("drawing_type"),
+                "overall_average_pt_per_mm": scale_data.get("overall_average_pt_per_mm"),
+                "overall_average_mm_per_pt": scale_data.get("overall_average_mm_per_pt"),
+                "regions": []
             }
             
-            # Log summary
-            logger.info(f"✅ Final result:")
-            logger.info(f"  Drawing type: {filtered_data.get('drawing_type')}")
-            logger.info(f"  Regions: {len(filtered_data.get('regions', []))}")
-            logger.info(f"  Total lines: {result['processing_info']['total_filtered_lines']}")
-            logger.info(f"  Total texts: {result['processing_info']['total_filtered_texts']}")
+            for region in scale_data.get("regions", []):
+                minified_scale_region = {
+                    "region_label": region.get("region_label"),
+                    "average_scale_pt_per_mm": region.get("average_scale_pt_per_mm"),
+                    "average_scale_mm_per_pt": region.get("average_scale_mm_per_pt"),
+                    "confidence": region.get("confidence"),
+                    "validation_status": region.get("validation_status")
+                }
+                minified_scale["regions"].append(minified_scale_region)
             
-            # Return appropriate format
-            if output_format == "txt":
-                summary = f"""=== SIMPLE PDF PROCESSING RESULT ===
+            result["filter_output"] = minified_filter
+            result["scale_output"] = minified_scale
+        
+        # Log summary
+        logger.info(f"✅ Processing complete:")
+        logger.info(f"  Drawing type: {filtered_data.get('drawing_type')}")
+        logger.info(f"  Regions: {len(filtered_data.get('regions', []))}")
+        logger.info(f"  Total lines: {result['processing_info']['total_filtered_lines']}")
+        logger.info(f"  Total texts: {result['processing_info']['total_filtered_texts']}")
+        logger.info(f"  Overall scale: {scale_data.get('overall_average_pt_per_mm', 'N/A')} pt/mm")
+        
+        # Return appropriate format
+        if output_format == "txt":
+            summary = f"""=== PDF PROCESSING RESULT ===
 Status: {result['status']}
 Drawing Type: {filtered_data.get('drawing_type')}
 Regions: {len(filtered_data.get('regions', []))}
 Total Lines: {result['processing_info']['total_filtered_lines']}
 Total Texts: {result['processing_info']['total_filtered_texts']}
+Overall Scale: {scale_data.get('overall_average_pt_per_mm', 'N/A')} pt/mm
 Timestamp: {result['timestamp']}
+Minified: {minify}
 
-REGIONS:
+FILTER REGIONS:
 """
-                for region in filtered_data.get('regions', []):
-                    summary += f"- {region.get('label')}: {len(region.get('lines', []))} lines, {len(region.get('texts', []))} texts\n"
-                
-                return PlainTextResponse(content=summary)
-            else:
-                return result
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Filter API request failed: {e}")
-            raise HTTPException(status_code=500, detail="Filter API connection failed")
+            for region in filtered_data.get('regions', []):
+                summary += f"- {region.get('label')}: {len(region.get('lines', []))} lines, {len(region.get('texts', []))} texts\n"
+            
+            summary += "\nSCALE REGIONS:\n"
+            for region in scale_data.get('regions', []):
+                summary += f"- {region.get('region_label')}: {region.get('average_scale_pt_per_mm', 'N/A')} pt/mm (confidence: {region.get('confidence', 0)}%)\n"
+            
+            return PlainTextResponse(content=summary)
+        else:
+            return result
     
     except HTTPException:
         raise
@@ -267,58 +383,49 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "version": "3.0.0",
-        "description": "Simple Master API - no data conversion issues"
+        "version": "4.0.0",
+        "description": "Master API with Scale Integration"
     }
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Simple Master API",
-        "version": "3.0.0",
-        "description": "Processes PDF with Vector Drawing API and Filter API - no conversion issues",
+        "title": "Master API with Scale Integration",
+        "version": "4.0.0",
+        "description": "Processes PDF with Vector Drawing API, Filter API, and Scale API",
         "workflow": [
             "1. Receive PDF file and vision_output (region coordinates)",
             "2. Call Vector Drawing API to extract lines and texts", 
             "3. Convert vision coordinates from image pixels to PDF points",
-            "4. Call Filter API directly with raw Vector API data",
-            "5. Return filtered data per region"
+            "4. Call Filter API to filter and organize data per region",
+            "5. Call Scale API to calculate scales from filtered data",
+            "6. Return both Filter output and Scale output"
         ],
-        "filter_system_explanation": {
-            "overview": "Filter API processes lines and texts per region with length-based filtering",
-            "steps": [
-                "1. Convert Vector API format ({p1: {x,y}, p2: {x,y}}) to internal format",
-                "2. For each region, check which lines intersect with region boundaries", 
-                "3. Apply length filtering based on drawing type (plattegrond > 50pt)",
-                "4. Return only lines and texts that belong to each region"
-            ],
-            "intersection_logic": [
-                "Method 1: Check if line endpoints are inside region",
-                "Method 2: Check if line spans across region boundaries", 
-                "Method 3: Use Shapely geometric intersection as fallback"
-            ],
-            "length_filters": {
-                "plattegrond": "Lines longer than 50 points",
-                "gevelaanzicht": "Lines longer than 40 points", 
-                "detailtekening": "Lines longer than 25 points",
-                "doorsnede": "Vertical lines > 30pts OR dashed lines",
-                "installatietekening": "Thin lines (≤1pt) OR dashed lines"
-            }
+        "apis_integrated": {
+            "vector_api": "https://vector-drawning.onrender.com/extract/",
+            "filter_api": "https://pre-filter-scale-api.onrender.com/filter-from-vector-api/",
+            "scale_api": "https://scale-api.onrender.com/calculate-scale/"
         },
-        "key_improvements": [
-            "No data conversion errors - uses Vector API format directly",
-            "Accurate region-based filtering with geometric intersection",
-            "Length-based line filtering per drawing type",
-            "Clean output structure per region only"
+        "output_structure": {
+            "filter_output": "Filtered lines and texts per region with orientations and midpoints",
+            "scale_output": "Calculated scales per region with confidence scores and validation"
+        },
+        "features": [
+            "Coordinate conversion from image pixels to PDF points",
+            "Region-based filtering with geometric intersection",
+            "Scale calculation with dimension-to-line matching",
+            "Minification support for cleaner output",
+            "Retry logic for all API calls",
+            "Combined Filter + Scale output"
         ],
         "endpoints": {
-            "/process/": "Main processing endpoint",
+            "/process/": "Main processing endpoint (supports minify=true/false)",
             "/health/": "Health check"
         }
     }
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting Simple Master API v3.0.0 on port {PORT}")
+    logger.info(f"Starting Master API with Scale Integration v4.0.0 on port {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
