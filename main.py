@@ -34,7 +34,7 @@ app.add_middleware(
 
 VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
 FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/filter-from-vector-api/"
-SCALE_API_URL = "https://scale-api.onrender.com/calculate-scale/"  # Update with your Scale API URL
+SCALE_API_URL = "https://scale-api-69gl.onrender.com/calculate-scale/"  
 
 MAX_RETRIES = 3
 
