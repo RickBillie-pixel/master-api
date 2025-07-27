@@ -18,9 +18,9 @@ logger = logging.getLogger(__name__)
 PORT = int(os.environ.get("PORT", 10000))
 
 app = FastAPI(
-    title="Master API with Scale Integration",
-    description="Processes PDF with Vector Drawing API, Filter API, and Scale API",
-    version="4.0.0"
+    title="Master API v4.1.0 - Scale API Compatible",
+    description="Processes PDF with Vector Drawing API, Filter API v6.0.0, and Scale API v4.0.0",
+    version="4.1.0"
 )
 
 # CORS middleware
@@ -32,9 +32,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# API URLs
 VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
 FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/filter-from-vector-api/"
-SCALE_API_URL = "https://scale-api-69gl.onrender.com/calculate-scale/"  
+SCALE_API_URL = "https://scale-api-69gl.onrender.com/calculate-scale/"
 
 MAX_RETRIES = 3
 
@@ -50,7 +51,7 @@ async def call_vector_api_with_retry(file_content: bytes, filename: str, params:
             
             files = {'file': (filename, file_content, 'application/pdf')}
             headers = {
-                'User-Agent': 'Master-API/4.0.0',
+                'User-Agent': 'Master-API/4.1.0',
                 'Accept': 'application/json',
                 'Connection': 'close'
             }
@@ -107,6 +108,9 @@ def convert_vision_coordinates_to_pdf(vision_data: Dict, pdf_page_size: Dict) ->
         scale_x = pdf_width_pts / image_width_px
         scale_y = pdf_height_pts / image_height_px
         
+        logger.info(f"Coordinate conversion: {image_width_px}x{image_height_px}px → {pdf_width_pts}x{pdf_height_pts}pts")
+        logger.info(f"Scale factors: x={scale_x:.4f}, y={scale_y:.4f}")
+        
         converted_regions = []
         for region in vision_data.get("regions", []):
             coord_block = region.get("coordinate_block", [])
@@ -126,11 +130,13 @@ def convert_vision_coordinates_to_pdf(vision_data: Dict, pdf_page_size: Dict) ->
                     round(y2_pdf, 1)
                 ]
                 converted_regions.append(converted_region)
+                
+                logger.debug(f"Region '{region.get('label')}': [{x1_img},{y1_img},{x2_img},{y2_img}]px → [{x1_pdf:.1f},{y1_pdf:.1f},{x2_pdf:.1f},{y2_pdf:.1f}]pts")
         
         converted_vision = vision_data.copy()
         converted_vision["regions"] = converted_regions
         
-        logger.info(f"✅ Converted {len(converted_regions)} regions")
+        logger.info(f"✅ Converted {len(converted_regions)} regions from image to PDF coordinates")
         return converted_vision
         
     except Exception as e:
@@ -138,8 +144,8 @@ def convert_vision_coordinates_to_pdf(vision_data: Dict, pdf_page_size: Dict) ->
         return vision_data
 
 async def call_filter_api(vector_data: Dict, converted_vision: Dict, debug: bool) -> Dict:
-    """Call Filter API with retry logic"""
-    logger.info("=== Calling Filter API ===")
+    """Call Filter API v6.0.0 with retry logic"""
+    logger.info("=== Calling Filter API v6.0.0 ===")
     
     for attempt in range(MAX_RETRIES):
         try:
@@ -148,6 +154,8 @@ async def call_filter_api(vector_data: Dict, converted_vision: Dict, debug: bool
                 "vector_data": vector_data,
                 "vision_output": converted_vision
             }
+            
+            logger.info(f"Filter API request: {len(vector_data.get('pages', []))} pages, {len(converted_vision.get('regions', []))} regions")
             
             filter_response = requests.post(
                 filter_url,
@@ -158,11 +166,18 @@ async def call_filter_api(vector_data: Dict, converted_vision: Dict, debug: bool
             
             if filter_response.status_code == 200:
                 logger.info("✅ Filter API call successful")
-                return filter_response.json()
+                filter_result = filter_response.json()
+                
+                # Log filter results
+                total_lines = sum(len(r.get('lines', [])) for r in filter_result.get('regions', []))
+                total_texts = sum(len(r.get('texts', [])) for r in filter_result.get('regions', []))
+                logger.info(f"Filter output: {len(filter_result.get('regions', []))} regions, {total_lines} lines, {total_texts} texts")
+                
+                return filter_result
             else:
                 logger.error(f"❌ Filter API returned {filter_response.status_code}: {filter_response.text}")
                 if attempt == MAX_RETRIES - 1:
-                    raise HTTPException(status_code=500, detail="Filter API failed")
+                    raise HTTPException(status_code=500, detail=f"Filter API failed: {filter_response.text}")
                     
         except requests.exceptions.RequestException as e:
             logger.error(f"Filter API request failed on attempt {attempt + 1}: {e}")
@@ -177,11 +192,19 @@ async def call_filter_api(vector_data: Dict, converted_vision: Dict, debug: bool
     raise HTTPException(status_code=500, detail="Filter API failed after all retries")
 
 async def call_scale_api(filtered_data: Dict, debug: bool) -> Dict:
-    """Call Scale API with retry logic"""
-    logger.info("=== Calling Scale API ===")
+    """Call Scale API v4.0.0 with retry logic"""
+    logger.info("=== Calling Scale API v4.0.0 ===")
     
     for attempt in range(MAX_RETRIES):
         try:
+            # Log what we're sending to Scale API
+            total_regions = len(filtered_data.get('regions', []))
+            logger.info(f"Scale API request: {total_regions} regions")
+            for region in filtered_data.get('regions', []):
+                lines_count = len(region.get('lines', []))
+                texts_count = len(region.get('texts', []))
+                logger.debug(f"  Region '{region.get('label')}': {lines_count} lines, {texts_count} texts")
+            
             scale_response = requests.post(
                 SCALE_API_URL,
                 json=filtered_data,
@@ -191,11 +214,17 @@ async def call_scale_api(filtered_data: Dict, debug: bool) -> Dict:
             
             if scale_response.status_code == 200:
                 logger.info("✅ Scale API call successful")
-                return scale_response.json()
+                scale_result = scale_response.json()
+                
+                # Log scale results
+                total_calculations = scale_result.get('total_calculations', 0)
+                logger.info(f"Scale output: {total_calculations} total calculations across {len(scale_result.get('regions', []))} regions")
+                
+                return scale_result
             else:
                 logger.error(f"❌ Scale API returned {scale_response.status_code}: {scale_response.text}")
                 if attempt == MAX_RETRIES - 1:
-                    raise HTTPException(status_code=500, detail="Scale API failed")
+                    raise HTTPException(status_code=500, detail=f"Scale API failed: {scale_response.text}")
                     
         except requests.exceptions.RequestException as e:
             logger.error(f"Scale API request failed on attempt {attempt + 1}: {e}")
@@ -217,9 +246,9 @@ async def process_pdf_with_scale(
     debug: bool = Form(default=False),
     minify: bool = Form(default=True)
 ):
-    """Process PDF with Vector API, Filter API, and Scale API integration"""
+    """Process PDF with Vector API, Filter API v6.0.0, and Scale API v4.0.0 integration"""
     try:
-        logger.info(f"=== Starting PDF Processing with Scale Integration ===")
+        logger.info(f"=== Starting PDF Processing with Scale Integration v4.1.0 ===")
         logger.info(f"File: {file.filename}, Debug: {debug}, Minify: {minify}")
         
         # Read file
@@ -231,12 +260,13 @@ async def process_pdf_with_scale(
         try:
             vision_data = json.loads(vision_output)
             regions_count = len(vision_data.get('regions', []))
-            logger.info(f"Vision regions: {regions_count}")
+            drawing_type = vision_data.get('drawing_type', 'unknown')
+            logger.info(f"Vision input: {drawing_type} with {regions_count} regions")
         except json.JSONDecodeError as e:
             raise HTTPException(status_code=400, detail=f"Invalid vision_output JSON: {str(e)}")
 
         # Call Vector API
-        logger.info("=== Calling Vector API ===")
+        logger.info("=== Step 1: Vector API ===")
         
         params = {
             'minify': str(minify).lower(),
@@ -251,21 +281,30 @@ async def process_pdf_with_scale(
             vector_data = json.loads(vector_response.text)
             if isinstance(vector_data, str):
                 vector_data = json.loads(vector_data)
+                
+            # Log vector extraction results
+            first_page = vector_data.get('pages', [{}])[0]
+            lines_count = len(first_page.get('drawings', {}).get('lines', []))
+            texts_count = len(first_page.get('texts', []))
+            logger.info(f"Vector extraction: {lines_count} lines, {texts_count} texts")
+            
         except Exception as e:
             logger.error(f"Vector API parsing error: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to parse Vector API response")
+            raise HTTPException(status_code=500, detail=f"Failed to parse Vector API response: {str(e)}")
 
-        # Extract PDF page dimensions and convert coordinates
-        logger.info("=== Converting Coordinates ===")
+        # Convert coordinates from image pixels to PDF points
+        logger.info("=== Step 2: Coordinate Conversion ===")
         
         first_page = vector_data['pages'][0]
         pdf_page_size = first_page.get('page_size', {"width": 595.0, "height": 842.0})
         converted_vision = convert_vision_coordinates_to_pdf(vision_data, pdf_page_size)
 
-        # Call Filter API
+        # Call Filter API v6.0.0
+        logger.info("=== Step 3: Filter API v6.0.0 ===")
         filtered_data = await call_filter_api(vector_data, converted_vision, debug)
         
-        # Call Scale API with filtered data
+        # Call Scale API v4.0.0 with filtered data
+        logger.info("=== Step 4: Scale API v4.0.0 ===")
         scale_data = await call_scale_api(filtered_data, debug)
         
         # Create combined result
@@ -275,13 +314,21 @@ async def process_pdf_with_scale(
             "scale_output": scale_data,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "processing_info": {
+                "drawing_type": filtered_data.get("drawing_type"),
                 "vector_api_lines": len(vector_data.get('pages', [{}])[0].get('drawings', {}).get('lines', [])),
                 "vector_api_texts": len(vector_data.get('pages', [{}])[0].get('texts', [])),
                 "filtered_regions": len(filtered_data.get('regions', [])),
                 "total_filtered_lines": sum(len(r.get('lines', [])) for r in filtered_data.get('regions', [])),
                 "total_filtered_texts": sum(len(r.get('texts', [])) for r in filtered_data.get('regions', [])),
                 "scale_regions": len(scale_data.get('regions', [])),
-                "minified": minify
+                "total_scale_calculations": scale_data.get('total_calculations', 0),
+                "global_average_scale": scale_data.get('global_average_scale_pt_per_mm'),
+                "minified": minify,
+                "api_versions": {
+                    "filter_api": "6.0.0-simplified",
+                    "scale_api": "4.0.0",
+                    "master_api": "4.1.0"
+                }
             }
         }
         
@@ -289,7 +336,7 @@ async def process_pdf_with_scale(
         if minify:
             logger.info("Applying minification...")
             
-            # Minify filter output
+            # Minify filter output (UNCHANGED - Filter API v6.0.0 format is already clean)
             minified_filter = {
                 "drawing_type": filtered_data.get("drawing_type"),
                 "regions": []
@@ -308,47 +355,59 @@ async def process_pdf_with_scale(
                     "texts": [
                         {
                             "text": text.get("text"),
-                            "midpoint": text.get("midpoint"),
-                            "orientation": text.get("orientation")
+                            "midpoint": text.get("midpoint")
                         } for text in region.get("texts", [])
                     ]
                 }
                 minified_filter["regions"].append(minified_region)
             
-            # Minify scale output - UPDATED FOR NEW SCALE API
+            # Minify scale output - UPDATED FOR SCALE API v4.0.0
             minified_scale = {
                 "drawing_type": scale_data.get("drawing_type"),
+                "total_regions": scale_data.get("total_regions"),
+                "total_calculations": scale_data.get("total_calculations"),
+                "global_average_scale_pt_per_mm": scale_data.get("global_average_scale_pt_per_mm"),
+                "global_average_scale_mm_per_pt": scale_data.get("global_average_scale_mm_per_pt"),
+                "global_average_formula": scale_data.get("global_average_formula"),
                 "regions": []
             }
             
             for region in scale_data.get("regions", []):
                 minified_scale_region = {
                     "region_label": region.get("region_label"),
-                    "horizontal": region.get("horizontal", []),  # Array van dimensie berekeningen
-                    "vertical": region.get("vertical", []),      # Array van dimensie berekeningen  
+                    "drawing_type": region.get("drawing_type"),
+                    # FIXED: Use correct field names from Scale API v4.0.0
+                    "horizontal_calculations": region.get("horizontal_calculations", []),
+                    "vertical_calculations": region.get("vertical_calculations", []),
+                    "total_calculations": region.get("total_calculations", 0),
                     "average_scale_pt_per_mm": region.get("average_scale_pt_per_mm"),
-                    "average_scale_mm_per_pt": region.get("average_scale_mm_per_pt")
+                    "average_scale_mm_per_pt": region.get("average_scale_mm_per_pt"),
+                    "average_calculation_formula": region.get("average_calculation_formula")
                 }
                 minified_scale["regions"].append(minified_scale_region)
             
             result["filter_output"] = minified_filter
             result["scale_output"] = minified_scale
         
-        # Log summary
+        # Log comprehensive summary
         logger.info(f"✅ Processing complete:")
         logger.info(f"  Drawing type: {filtered_data.get('drawing_type')}")
-        logger.info(f"  Regions: {len(filtered_data.get('regions', []))}")
-        logger.info(f"  Total lines: {result['processing_info']['total_filtered_lines']}")
-        logger.info(f"  Total texts: {result['processing_info']['total_filtered_texts']}")
+        logger.info(f"  Regions processed: {len(filtered_data.get('regions', []))}")
+        logger.info(f"  Total filtered lines: {result['processing_info']['total_filtered_lines']}")
+        logger.info(f"  Total filtered texts: {result['processing_info']['total_filtered_texts']}")
+        logger.info(f"  Total scale calculations: {scale_data.get('total_calculations', 0)}")
+        logger.info(f"  Global average scale: {scale_data.get('global_average_scale_pt_per_mm', 'N/A')} pt/mm")
         
         # Return appropriate format
         if output_format == "txt":
-            summary = f"""=== PDF PROCESSING RESULT ===
+            summary = f"""=== PDF PROCESSING RESULT v4.1.0 ===
 Status: {result['status']}
 Drawing Type: {filtered_data.get('drawing_type')}
 Regions: {len(filtered_data.get('regions', []))}
 Total Lines: {result['processing_info']['total_filtered_lines']}
 Total Texts: {result['processing_info']['total_filtered_texts']}
+Total Scale Calculations: {scale_data.get('total_calculations', 0)}
+Global Average Scale: {scale_data.get('global_average_scale_pt_per_mm', 'N/A')} pt/mm
 Timestamp: {result['timestamp']}
 Minified: {minify}
 
@@ -359,10 +418,14 @@ FILTER REGIONS:
             
             summary += "\nSCALE REGIONS:\n"
             for region in scale_data.get('regions', []):
-                h_count = len(region.get('horizontal', []))
-                v_count = len(region.get('vertical', []))
+                h_count = len(region.get('horizontal_calculations', []))
+                v_count = len(region.get('vertical_calculations', []))
+                total_calcs = region.get('total_calculations', 0)
                 avg_scale = region.get('average_scale_pt_per_mm', 'N/A')
-                summary += f"- {region.get('region_label')}: {h_count} horizontal, {v_count} vertical dimensions, avg scale: {avg_scale} pt/mm\n"
+                summary += f"- {region.get('region_label')}: {total_calcs} calculations ({h_count}H + {v_count}V), avg scale: {avg_scale} pt/mm\n"
+            
+            if scale_data.get('global_average_formula'):
+                summary += f"\nGLOBAL AVERAGE CALCULATION:\n{scale_data.get('global_average_formula')}\n"
             
             return PlainTextResponse(content=summary)
         else:
@@ -371,7 +434,7 @@ FILTER REGIONS:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
+        logger.error(f"Unexpected error in process_pdf_with_scale: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/health/")
@@ -379,24 +442,41 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "version": "4.0.0",
-        "description": "Master API with Scale Integration"
+        "version": "4.1.0",
+        "description": "Master API with Scale Integration",
+        "api_compatibility": {
+            "filter_api": "6.0.0-simplified",
+            "scale_api": "4.0.0",
+            "vector_api": "latest"
+        },
+        "features": [
+            "Compatible with Filter API v6.0.0 simplified rules",
+            "Compatible with Scale API v4.0.0 (3H + 3V calculations)",
+            "Coordinate conversion from image pixels to PDF points",
+            "Comprehensive logging and error handling",
+            "Minification with correct field names"
+        ]
     }
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Master API with Scale Integration",
-        "version": "4.0.0",
-        "description": "Processes PDF with Vector Drawing API, Filter API, and Scale API",
+        "title": "Master API v4.1.0 - Scale API Compatible",
+        "version": "4.1.0",
+        "description": "Processes PDF with Vector Drawing API, Filter API v6.0.0, and Scale API v4.0.0",
+        "compatibility": {
+            "filter_api": "v6.0.0-simplified (all orientations, no max length, 25pt buffer)",
+            "scale_api": "v4.0.0 (3H + 3V calculations per region, 12pt max distance)",
+            "vector_api": "latest (PDF vector extraction)"
+        },
         "workflow": [
-            "1. Receive PDF file and vision_output (region coordinates)",
-            "2. Call Vector Drawing API to extract lines and texts", 
+            "1. Receive PDF file and vision_output (region coordinates in image pixels)",
+            "2. Call Vector Drawing API to extract lines and texts from PDF", 
             "3. Convert vision coordinates from image pixels to PDF points",
-            "4. Call Filter API to filter and organize data per region",
-            "5. Call Scale API to calculate scales from filtered data",
-            "6. Return both Filter output and Scale output"
+            "4. Call Filter API v6.0.0 to filter and organize data per region",
+            "5. Call Scale API v4.0.0 to calculate scales (3H + 3V per region)",
+            "6. Return both Filter output and Scale output with comprehensive stats"
         ],
         "apis_integrated": {
             "vector_api": "https://vector-drawning.onrender.com/extract/",
@@ -404,24 +484,38 @@ async def root():
             "scale_api": "https://scale-api-69gl.onrender.com/calculate-scale/"
         },
         "output_structure": {
-            "filter_output": "Filtered lines and texts per region with orientations and midpoints",
-            "scale_output": "Top 3 horizontal and vertical dimension calculations per region"
+            "filter_output": {
+                "description": "Filtered lines and texts per region",
+                "features": ["Orientations (H/V/diagonal)", "Midpoints", "25pt region buffer"]
+            },
+            "scale_output": {
+                "description": "Scale calculations per region",
+                "features": ["3 horizontal + 3 vertical per region", "Calculation formulas", "Regional and global averages"]
+            },
+            "processing_info": {
+                "description": "Comprehensive statistics",
+                "includes": ["API versions", "Counts per stage", "Global averages"]
+            }
         },
-        "features": [
-            "Coordinate conversion from image pixels to PDF points",
-            "Region-based filtering with geometric intersection",
-            "Scale calculation with top 3 dimensions per orientation",
-            "Minification support for cleaner output",
-            "Retry logic for all API calls",
-            "Combined Filter + Scale output"
+        "improvements_v4_1": [
+            "✅ Fixed Scale API v4.0.0 field name compatibility",
+            "✅ Enhanced logging with detailed statistics",
+            "✅ Proper coordinate conversion logging",
+            "✅ Global average scale reporting",
+            "✅ API version tracking",
+            "✅ Comprehensive error handling"
         ],
+        "expected_usage": {
+            "scenario": "6 regions × 6 calculations = 36 total calculations",
+            "output": "Regional averages + global average scale"
+        },
         "endpoints": {
-            "/process/": "Main processing endpoint (supports minify=true/false)",
-            "/health/": "Health check"
+            "/process/": "Main processing endpoint (supports minify=true/false, output_format=json/txt)",
+            "/health/": "Health check with API compatibility info"
         }
     }
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting Master API with Scale Integration v4.0.0 on port {PORT}")
+    logger.info(f"Starting Master API v4.1.0 - Scale API Compatible on port {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
