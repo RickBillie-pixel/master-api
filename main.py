@@ -182,10 +182,8 @@ async def call_scale_api(filtered_data: Dict, debug: bool) -> Dict:
     
     for attempt in range(MAX_RETRIES):
         try:
-            scale_url = f"{SCALE_API_URL}?debug={str(debug).lower()}"
-            
             scale_response = requests.post(
-                scale_url,
+                SCALE_API_URL,
                 json=filtered_data,
                 headers={'Content-Type': 'application/json'},
                 timeout=300
@@ -283,7 +281,6 @@ async def process_pdf_with_scale(
                 "total_filtered_lines": sum(len(r.get('lines', [])) for r in filtered_data.get('regions', [])),
                 "total_filtered_texts": sum(len(r.get('texts', [])) for r in filtered_data.get('regions', [])),
                 "scale_regions": len(scale_data.get('regions', [])),
-                "overall_scale_pt_per_mm": scale_data.get('overall_average_pt_per_mm'),
                 "minified": minify
             }
         }
@@ -318,21 +315,19 @@ async def process_pdf_with_scale(
                 }
                 minified_filter["regions"].append(minified_region)
             
-            # Minify scale output
+            # Minify scale output - UPDATED FOR NEW SCALE API
             minified_scale = {
                 "drawing_type": scale_data.get("drawing_type"),
-                "overall_average_pt_per_mm": scale_data.get("overall_average_pt_per_mm"),
-                "overall_average_mm_per_pt": scale_data.get("overall_average_mm_per_pt"),
                 "regions": []
             }
             
             for region in scale_data.get("regions", []):
                 minified_scale_region = {
                     "region_label": region.get("region_label"),
+                    "horizontal": region.get("horizontal", []),  # Array van dimensie berekeningen
+                    "vertical": region.get("vertical", []),      # Array van dimensie berekeningen  
                     "average_scale_pt_per_mm": region.get("average_scale_pt_per_mm"),
-                    "average_scale_mm_per_pt": region.get("average_scale_mm_per_pt"),
-                    "confidence": region.get("confidence"),
-                    "validation_status": region.get("validation_status")
+                    "average_scale_mm_per_pt": region.get("average_scale_mm_per_pt")
                 }
                 minified_scale["regions"].append(minified_scale_region)
             
@@ -345,7 +340,6 @@ async def process_pdf_with_scale(
         logger.info(f"  Regions: {len(filtered_data.get('regions', []))}")
         logger.info(f"  Total lines: {result['processing_info']['total_filtered_lines']}")
         logger.info(f"  Total texts: {result['processing_info']['total_filtered_texts']}")
-        logger.info(f"  Overall scale: {scale_data.get('overall_average_pt_per_mm', 'N/A')} pt/mm")
         
         # Return appropriate format
         if output_format == "txt":
@@ -355,7 +349,6 @@ Drawing Type: {filtered_data.get('drawing_type')}
 Regions: {len(filtered_data.get('regions', []))}
 Total Lines: {result['processing_info']['total_filtered_lines']}
 Total Texts: {result['processing_info']['total_filtered_texts']}
-Overall Scale: {scale_data.get('overall_average_pt_per_mm', 'N/A')} pt/mm
 Timestamp: {result['timestamp']}
 Minified: {minify}
 
@@ -366,7 +359,10 @@ FILTER REGIONS:
             
             summary += "\nSCALE REGIONS:\n"
             for region in scale_data.get('regions', []):
-                summary += f"- {region.get('region_label')}: {region.get('average_scale_pt_per_mm', 'N/A')} pt/mm (confidence: {region.get('confidence', 0)}%)\n"
+                h_count = len(region.get('horizontal', []))
+                v_count = len(region.get('vertical', []))
+                avg_scale = region.get('average_scale_pt_per_mm', 'N/A')
+                summary += f"- {region.get('region_label')}: {h_count} horizontal, {v_count} vertical dimensions, avg scale: {avg_scale} pt/mm\n"
             
             return PlainTextResponse(content=summary)
         else:
@@ -405,16 +401,16 @@ async def root():
         "apis_integrated": {
             "vector_api": "https://vector-drawning.onrender.com/extract/",
             "filter_api": "https://pre-filter-scale-api.onrender.com/filter-from-vector-api/",
-            "scale_api": "https://scale-api.onrender.com/calculate-scale/"
+            "scale_api": "https://scale-api-69gl.onrender.com/calculate-scale/"
         },
         "output_structure": {
             "filter_output": "Filtered lines and texts per region with orientations and midpoints",
-            "scale_output": "Calculated scales per region with confidence scores and validation"
+            "scale_output": "Top 3 horizontal and vertical dimension calculations per region"
         },
         "features": [
             "Coordinate conversion from image pixels to PDF points",
             "Region-based filtering with geometric intersection",
-            "Scale calculation with dimension-to-line matching",
+            "Scale calculation with top 3 dimensions per orientation",
             "Minification support for cleaner output",
             "Retry logic for all API calls",
             "Combined Filter + Scale output"
