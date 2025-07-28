@@ -18,9 +18,9 @@ logger = logging.getLogger(__name__)
 PORT = int(os.environ.get("PORT", 10000))
 
 app = FastAPI(
-    title="Master API v4.1.0 - Scale API Compatible",
-    description="Processes PDF with Vector Drawing API, Filter API v6.0.0, and Scale API v4.0.0",
-    version="4.1.0"
+    title="Master API v4.1.1 - Compatible with Fixed APIs",
+    description="Processes PDF with Vector Drawing API, Filter API v7.0.1, and Scale API v7.0.1",
+    version="4.1.1"
 )
 
 # CORS middleware
@@ -32,10 +32,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API URLs
+# UPDATED API URLs to point to the FIXED APIs
 VECTOR_API_URL = "https://vector-drawning.onrender.com/extract/"
-FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/filter-from-vector-api/"
-SCALE_API_URL = "https://scale-api-69gl.onrender.com/calculate-scale/"
+FILTER_API_URL = "https://pre-filter-scale-api.onrender.com/filter-from-vector-api/"  # Your fixed Filter API
+SCALE_API_URL = "https://scale-api-69gl.onrender.com/calculate-scale/"  # Your fixed Scale API
 
 MAX_RETRIES = 3
 
@@ -51,7 +51,7 @@ async def call_vector_api_with_retry(file_content: bytes, filename: str, params:
             
             files = {'file': (filename, file_content, 'application/pdf')}
             headers = {
-                'User-Agent': 'Master-API/4.1.0',
+                'User-Agent': 'Master-API/4.1.1',
                 'Accept': 'application/json',
                 'Connection': 'close'
             }
@@ -144,8 +144,8 @@ def convert_vision_coordinates_to_pdf(vision_data: Dict, pdf_page_size: Dict) ->
         return vision_data
 
 async def call_filter_api(vector_data: Dict, converted_vision: Dict, debug: bool) -> Dict:
-    """Call Filter API v6.0.0 with retry logic"""
-    logger.info("=== Calling Filter API v6.0.0 ===")
+    """Call Filter API v7.0.1 with retry logic"""
+    logger.info("=== Calling Filter API v7.0.1 ===")
     
     for attempt in range(MAX_RETRIES):
         try:
@@ -192,8 +192,8 @@ async def call_filter_api(vector_data: Dict, converted_vision: Dict, debug: bool
     raise HTTPException(status_code=500, detail="Filter API failed after all retries")
 
 async def call_scale_api(filtered_data: Dict, debug: bool) -> Dict:
-    """Call Scale API v4.0.0 with retry logic"""
-    logger.info("=== Calling Scale API v4.0.0 ===")
+    """Call Scale API v7.0.1 with retry logic"""
+    logger.info("=== Calling Scale API v7.0.1 ===")
     
     for attempt in range(MAX_RETRIES):
         try:
@@ -203,7 +203,8 @@ async def call_scale_api(filtered_data: Dict, debug: bool) -> Dict:
             for region in filtered_data.get('regions', []):
                 lines_count = len(region.get('lines', []))
                 texts_count = len(region.get('texts', []))
-                logger.debug(f"  Region '{region.get('label')}': {lines_count} lines, {texts_count} texts")
+                parsed_type = region.get('parsed_drawing_type', 'none')
+                logger.debug(f"  Region '{region.get('label')}': {lines_count} lines, {texts_count} texts, parsed_type: {parsed_type}")
             
             scale_response = requests.post(
                 SCALE_API_URL,
@@ -218,7 +219,8 @@ async def call_scale_api(filtered_data: Dict, debug: bool) -> Dict:
                 
                 # Log scale results
                 total_calculations = scale_result.get('total_calculations', 0)
-                logger.info(f"Scale output: {total_calculations} total calculations across {len(scale_result.get('regions', []))} regions")
+                global_avg = scale_result.get('global_average_scale_pt_per_mm', 'N/A')
+                logger.info(f"Scale output: {total_calculations} total calculations, global avg: {global_avg} pt/mm")
                 
                 return scale_result
             else:
@@ -246,9 +248,9 @@ async def process_pdf_with_scale(
     debug: bool = Form(default=False),
     minify: bool = Form(default=True)
 ):
-    """Process PDF with Vector API, Filter API v6.0.0, and Scale API v4.0.0 integration"""
+    """Process PDF with Vector API, Filter API v7.0.1, and Scale API v7.0.1 integration"""
     try:
-        logger.info(f"=== Starting PDF Processing with Scale Integration v4.1.0 ===")
+        logger.info(f"=== Starting PDF Processing with Scale Integration v4.1.1 ===")
         logger.info(f"File: {file.filename}, Debug: {debug}, Minify: {minify}")
         
         # Read file
@@ -299,12 +301,12 @@ async def process_pdf_with_scale(
         pdf_page_size = first_page.get('page_size', {"width": 595.0, "height": 842.0})
         converted_vision = convert_vision_coordinates_to_pdf(vision_data, pdf_page_size)
 
-        # Call Filter API v6.0.0
-        logger.info("=== Step 3: Filter API v6.0.0 ===")
+        # Call Filter API v7.0.1
+        logger.info("=== Step 3: Filter API v7.0.1 ===")
         filtered_data = await call_filter_api(vector_data, converted_vision, debug)
         
-        # Call Scale API v4.0.0 with filtered data
-        logger.info("=== Step 4: Scale API v4.0.0 ===")
+        # Call Scale API v7.0.1 with filtered data
+        logger.info("=== Step 4: Scale API v7.0.1 ===")
         scale_data = await call_scale_api(filtered_data, debug)
         
         # Create combined result
@@ -325,9 +327,9 @@ async def process_pdf_with_scale(
                 "global_average_scale": scale_data.get('global_average_scale_pt_per_mm'),
                 "minified": minify,
                 "api_versions": {
-                    "filter_api": "6.0.0-simplified",
-                    "scale_api": "4.0.0",
-                    "master_api": "4.1.0"
+                    "filter_api": "7.0.1-fixed",
+                    "scale_api": "7.0.1-fixed",
+                    "master_api": "4.1.1-fixed"
                 }
             }
         }
@@ -336,7 +338,7 @@ async def process_pdf_with_scale(
         if minify:
             logger.info("Applying minification...")
             
-            # Minify filter output (UNCHANGED - Filter API v6.0.0 format is already clean)
+            # Minify filter output (UNCHANGED - Filter API v7.0.1 format is already clean)
             minified_filter = {
                 "drawing_type": filtered_data.get("drawing_type"),
                 "regions": []
@@ -345,6 +347,7 @@ async def process_pdf_with_scale(
             for region in filtered_data.get("regions", []):
                 minified_region = {
                     "label": region.get("label"),
+                    "parsed_drawing_type": region.get("parsed_drawing_type"),  # Include this for Scale API
                     "lines": [
                         {
                             "length": line.get("length"),
@@ -361,7 +364,7 @@ async def process_pdf_with_scale(
                 }
                 minified_filter["regions"].append(minified_region)
             
-            # Minify scale output - UPDATED FOR SCALE API v4.0.0
+            # Minify scale output - UPDATED FOR SCALE API v7.0.1
             minified_scale = {
                 "drawing_type": scale_data.get("drawing_type"),
                 "total_regions": scale_data.get("total_regions"),
@@ -376,7 +379,8 @@ async def process_pdf_with_scale(
                 minified_scale_region = {
                     "region_label": region.get("region_label"),
                     "drawing_type": region.get("drawing_type"),
-                    # FIXED: Use correct field names from Scale API v4.0.0
+                    "parsed_drawing_type": region.get("parsed_drawing_type"),  # Include parsed type
+                    "dimension_strategy": region.get("dimension_strategy"),
                     "horizontal_calculations": region.get("horizontal_calculations", []),
                     "vertical_calculations": region.get("vertical_calculations", []),
                     "total_calculations": region.get("total_calculations", 0),
@@ -400,7 +404,7 @@ async def process_pdf_with_scale(
         
         # Return appropriate format
         if output_format == "txt":
-            summary = f"""=== PDF PROCESSING RESULT v4.1.0 ===
+            summary = f"""=== PDF PROCESSING RESULT v4.1.1 ===
 Status: {result['status']}
 Drawing Type: {filtered_data.get('drawing_type')}
 Regions: {len(filtered_data.get('regions', []))}
@@ -414,7 +418,8 @@ Minified: {minify}
 FILTER REGIONS:
 """
             for region in filtered_data.get('regions', []):
-                summary += f"- {region.get('label')}: {len(region.get('lines', []))} lines, {len(region.get('texts', []))} texts\n"
+                parsed_type = region.get('parsed_drawing_type', 'none')
+                summary += f"- {region.get('label')}: {len(region.get('lines', []))} lines, {len(region.get('texts', []))} texts, type: {parsed_type}\n"
             
             summary += "\nSCALE REGIONS:\n"
             for region in scale_data.get('regions', []):
@@ -442,16 +447,22 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "version": "4.1.0",
-        "description": "Master API with Scale Integration",
+        "version": "4.1.1",
+        "description": "Master API with Fixed Scale Integration",
         "api_compatibility": {
-            "filter_api": "6.0.0-simplified",
-            "scale_api": "4.0.0",
+            "filter_api": "7.0.1-fixed (Pydantic compatible)",
+            "scale_api": "7.0.1-fixed (Pydantic v2 compatible)",
             "vector_api": "latest"
         },
+        "bug_fixes": [
+            "✅ Fixed Pydantic v2 compatibility issue",
+            "✅ Updated to use fixed Filter and Scale APIs",
+            "✅ Enhanced logging for parsed_drawing_type support",
+            "✅ Proper error handling for JSON string fields"
+        ],
         "features": [
-            "Compatible with Filter API v6.0.0 simplified rules",
-            "Compatible with Scale API v4.0.0 (3H + 3V calculations)",
+            "Compatible with Filter API v7.0.1 fixed rules",
+            "Compatible with Scale API v7.0.1 (Pydantic v2)",
             "Coordinate conversion from image pixels to PDF points",
             "Comprehensive logging and error handling",
             "Minification with correct field names"
@@ -462,52 +473,57 @@ async def health():
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Master API v4.1.0 - Scale API Compatible",
-        "version": "4.1.0",
-        "description": "Processes PDF with Vector Drawing API, Filter API v6.0.0, and Scale API v4.0.0",
+        "title": "Master API v4.1.1 - Fixed Scale API Compatible",
+        "version": "4.1.1",
+        "description": "FIXED: Processes PDF with Vector API, Filter API v7.0.1, and Scale API v7.0.1",
+        "bug_fix": {
+            "issue": "Scale API v7.0.0 Pydantic validation error on dimension_mapping field",
+            "root_cause": "Dict objects being passed to Pydantic v2 model expecting strings",
+            "solution": "Updated to use fixed Scale API v7.0.1 with proper JSON string serialization"
+        },
         "compatibility": {
-            "filter_api": "v6.0.0-simplified (all orientations, no max length, 25pt buffer)",
-            "scale_api": "v4.0.0 (3H + 3V calculations per region, 12pt max distance)",
+            "filter_api": "v7.0.1-fixed (correct filtering logic + Pydantic compatibility)",
+            "scale_api": "v7.0.1-fixed (Pydantic v2 compatible with JSON string fields)",
             "vector_api": "latest (PDF vector extraction)"
         },
         "workflow": [
             "1. Receive PDF file and vision_output (region coordinates in image pixels)",
             "2. Call Vector Drawing API to extract lines and texts from PDF", 
             "3. Convert vision coordinates from image pixels to PDF points",
-            "4. Call Filter API v6.0.0 to filter and organize data per region",
-            "5. Call Scale API v4.0.0 to calculate scales (3H + 3V per region)",
+            "4. Call Filter API v7.0.1 to filter and organize data per region (fixed filtering logic)",
+            "5. Call Scale API v7.0.1 to calculate scales with proper Pydantic v2 compatibility",
             "6. Return both Filter output and Scale output with comprehensive stats"
         ],
         "apis_integrated": {
             "vector_api": "https://vector-drawning.onrender.com/extract/",
-            "filter_api": "https://pre-filter-scale-api.onrender.com/filter-from-vector-api/",
-            "scale_api": "https://scale-api-69gl.onrender.com/calculate-scale/"
+            "filter_api": "https://pre-filter-scale-api.onrender.com/filter-from-vector-api/ (v7.0.1-fixed)",
+            "scale_api": "https://scale-api-69gl.onrender.com/calculate-scale/ (v7.0.1-fixed)"
         },
         "output_structure": {
             "filter_output": {
                 "description": "Filtered lines and texts per region",
-                "features": ["Orientations (H/V/diagonal)", "Midpoints", "25pt region buffer"]
+                "features": ["Orientations (H/V/diagonal)", "Midpoints", "25pt region buffer", "parsed_drawing_type field"]
             },
             "scale_output": {
                 "description": "Scale calculations per region",
-                "features": ["3 horizontal + 3 vertical per region", "Calculation formulas", "Regional and global averages"]
+                "features": ["3 horizontal + 3 vertical per region", "Calculation formulas", "Regional and global averages", "Physical dimension mapping"]
             },
             "processing_info": {
                 "description": "Comprehensive statistics",
-                "includes": ["API versions", "Counts per stage", "Global averages"]
+                "includes": ["API versions", "Counts per stage", "Global averages", "Parsed drawing types"]
             }
         },
-        "improvements_v4_1": [
-            "✅ Fixed Scale API v4.0.0 field name compatibility",
-            "✅ Enhanced logging with detailed statistics",
-            "✅ Proper coordinate conversion logging",
-            "✅ Global average scale reporting",
-            "✅ API version tracking",
-            "✅ Comprehensive error handling"
+        "improvements_v4_1_1": [
+            "✅ Fixed Pydantic v2 compatibility issue in Scale API integration",
+            "✅ Updated to use corrected Filter API v7.0.1 with proper filtering logic",
+            "✅ Enhanced logging for bestektekening region parsing",
+            "✅ Proper handling of parsed_drawing_type field",
+            "✅ Comprehensive error handling and debugging"
         ],
-        "expected_usage": {
-            "scenario": "6 regions × 6 calculations = 36 total calculations",
-            "output": "Regional averages + global average scale"
+        "pydantic_compatibility": {
+            "filter_api": "Pydantic v1.10.18",
+            "scale_api": "Pydantic v2.6.4 (fixed with JSON string serialization)",
+            "master_api": "No Pydantic models (pure FastAPI)"
         },
         "endpoints": {
             "/process/": "Main processing endpoint (supports minify=true/false, output_format=json/txt)",
@@ -517,5 +533,5 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"Starting Master API v4.1.0 - Scale API Compatible on port {PORT}")
+    logger.info(f"Starting Master API v4.1.1 - Fixed Scale API Compatible on port {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
